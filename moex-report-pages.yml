@@ -1,0 +1,47 @@
+# Собирает отчёт и публикует в ветку gh-pages (GitHub Pages).
+# Интервал подберите под длительность прогона: при длинной генерации ставьте реже (например раз в час).
+
+name: MOEX report → GitHub Pages
+
+on:
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: "12 * * * *" # каждый час в :12 UTC; для чаще — смените cron (риск очереди при долгой сборке)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: moex-report-pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate report
+        run: python moex_risk_monitor.py
+
+      - name: Prepare static site
+        run: |
+          mkdir -p _site
+          cp moex_report.html _site/index.html
+          cp moex_report.html _site/moex_report.html
+          cp moex_report_data.json _site/
+          touch _site/.nojekyll
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: _site
+          force_orphan: true
