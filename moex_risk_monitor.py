@@ -744,14 +744,14 @@ def build_table_rows(
                 "secid": secid,
                 "ticker": ticker,
                 "shortname": disp_name,
-                "close0": round(c0, 6),
-                "close1": round(c1, 6),
-                "close2": round(c2, 6),
-                "chg1": round(ch1, 4),
-                "chg2": round(ch2, 4),
-                "risk": round(rk * 100, 4) if rk is not None else None,
-                "ratio1": round(rp1, 2) if rp1 is not None else None,
-                "ratio2": round(rp2, 2) if rp2 is not None else None,
+                "close0": round(c0, 1),
+                "close1": round(c1, 1),
+                "close2": round(c2, 1),
+                "chg1": round(ch1, 1),
+                "chg2": round(ch2, 1),
+                "risk": round(rk * 100, 1) if rk is not None else None,
+                "ratio1": round(rp1, 1) if rp1 is not None else None,
+                "ratio2": round(rp2, 1) if rp2 is not None else None,
                 "vol_rub": round(vr, 2) if vr is not None else None,
                 "hl": row_highlight(rp1, rp2),
             }
@@ -802,14 +802,14 @@ def build_table_rows(
                 "secid": secid,
                 "ticker": tkr,
                 "shortname": disp_name,
-                "close0": round(c, 6),
-                "close1": round(c1, 6),
-                "close2": round(c2, 6),
-                "chg1": round(ch1, 4),
-                "chg2": round(ch2, 4),
-                "risk": round(rk * 100, 4) if rk is not None else None,
-                "ratio1": round(rp1, 2) if rp1 is not None else None,
-                "ratio2": round(rp2, 2) if rp2 is not None else None,
+                "close0": round(c, 1),
+                "close1": round(c1, 1),
+                "close2": round(c2, 1),
+                "chg1": round(ch1, 1),
+                "chg2": round(ch2, 1),
+                "risk": round(rk * 100, 1) if rk is not None else None,
+                "ratio1": round(rp1, 1) if rp1 is not None else None,
+                "ratio2": round(rp2, 1) if rp2 is not None else None,
                 "vol_rub": round(vr, 2) if vr is not None else None,
                 "hl": row_highlight(rp1, rp2),
             }
@@ -1352,7 +1352,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     const cols = colList || COLS;
     tbody.innerHTML = rows.map(r => {
       const f = (x) => (x != null && x !== '') ? x : '<span class="num-null">—</span>';
-      const fmtNum = (x) => (x != null && typeof x === 'number') ? x.toLocaleString('ru-RU', { maximumFractionDigits: 4 }) : f(x);
+      const fmtNum = (x) => (x != null && typeof x === 'number')
+        ? x.toLocaleString('ru-RU', { minimumFractionDigits: 0, maximumFractionDigits: 1 })
+        : f(x);
       const fmtVol = (x) => (x != null && typeof x === 'number') ? x.toLocaleString('ru-RU', { maximumFractionDigits: 0 }) : f(x);
       return '<tr class="' + (r.hl || '') + '">' + cols.map(c => cellHtml(c, r, f, fmtNum, fmtVol)).join('') + '</tr>';
     }).join('');
