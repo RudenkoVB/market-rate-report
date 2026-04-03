@@ -6,9 +6,9 @@
 Запуск: python moex_risk_monitor.py
 Создаются moex_report.html и moex_report_data.json в этой папке; открывается HTML в браузере.
 
-В блоке «Текущие данные» котировки запрашиваются отдельным вызовом ISS по каждому инструменту
-(/engines/.../securities/<SECID>.json), как на карточке инструмента на moex.com; блок
-«Итоги торгового дня» строится по истории закрытий без изменений.
+В блоке «Текущие данные» котировки — таблица marketdata ISS (текущая торговая сессия: LAST,
+MARKETPRICE и др.); запросы батчами по параметру securities=… с отключением кэша HTTP, чтобы
+получить снимок онлайн-данных на момент актуализации. «Итоги торгового дня» — по истории закрытий.
 
 Ставки риска 1 ур.: публичные таблицы RMS MOEX ISS (im1 для фондового и валютного рынков,
 mr1 для срочного) — те же значения, что публикуются в статических риск-параметрах НКЦ
@@ -18,6 +18,7 @@ mr1 для срочного) — те же значения, что публик
 
 from __future__ import annotations
 
+import bisect
 import json
 import math
 import os
@@ -33,7 +34,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 # МСК = UTC+3 (в РФ постоянно, без перевода часов).
 MSK_TZ = timezone(timedelta(hours=3))
@@ -45,6 +46,9 @@ EOD_LOOKBACK_DAYS = 45
 EOD_DAYS_TO_SHOW = 5
 # Сколько уникальных торговых дней-кандидатов перебрать (с новых к старым), чтобы набрать EOD_DAYS_TO_SHOW.
 EOD_CANDIDATE_TRADING_DAYS = 28
+# Онлайн-котировки: сколько SECID в одном ISS-запросе marketdata и сколько батчей параллельно.
+LIVE_MARKETDATA_CHUNK = 48
+LIVE_MARKETDATA_MAX_WORKERS = 20
 
 # Фьючерс: только краткое имя вида Si-6.26 (без спредов и опционов)
 FUT_NAME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]*)-(\d{1,2})\.(\d{2})$")
@@ -57,6 +61,9 @@ CACHE_VER = "v2"
 MOEX_CONTRACT_PAGE = "https://www.moex.com/ru/contract.aspx"
 FUT_MOEX_TITLES_FILE = CACHE_DIR / f"fut_moex_titles_{CACHE_VER}.json"
 _MOEX_TITLE_CACHE: Optional[Dict[str, str]] = None
+
+# Кэш списков торговых дат за один прогон generate_report (снижает число запросов к ISS).
+_TRADING_DATES_MEMO: Dict[Tuple[str, str, str], List[str]] = {}
 
 
 def fetch_text(url: str, timeout: float = 30.0) -> str:
@@ -221,6 +228,54 @@ def fetch_json(url: str, timeout: float = 120.0, retries: int = 4) -> Any:
             last_err = e
             if attempt < retries - 1:
                 time.sleep(min(10.0, 2.0**attempt))
+                continue
+            raise
+    assert last_err is not None
+    raise last_err
+
+
+def fetch_json_live(url: str, timeout: float = 60.0, retries: int = 3) -> Any:
+    """
+    Запрос таблицы marketdata ISS для «Текущих данных»: без кэширования на стороне клиента,
+    уникальный query-параметр на попытку (актуальный снимок сессии на момент запроса).
+    """
+    last_err: Optional[BaseException] = None
+    for attempt in range(retries):
+        sep = "&" if "?" in url else "?"
+        url_bust = f"{url}{sep}_nocache={time.time_ns()}"
+        try:
+            req = urllib.request.Request(
+                url_bust,
+                headers={
+                    "User-Agent": "moex-risk-monitor/3.0-live",
+                    "Cache-Control": "no-cache, no-store",
+                    "Pragma": "no-cache",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in (429, 502, 503, 504) and attempt < retries - 1:
+                time.sleep(min(6.0, 1.5**attempt))
+                continue
+            raise
+        except (TimeoutError, socket.timeout) as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(min(6.0, 1.5**attempt))
+                continue
+            raise
+        except (urllib.error.URLError, ConnectionError, BrokenPipeError, OSError) as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(min(6.0, 1.5**attempt))
+                continue
+            raise
+        except json.JSONDecodeError as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(min(6.0, 1.5**attempt))
                 continue
             raise
     assert last_err is not None
@@ -514,16 +569,17 @@ def pick_futures_sample_sec() -> str:
     return "SiM6"
 
 
-def _trading_dates_up_to(cfg: MarketConfig, report_end: date) -> List[str]:
+def _trading_dates_between(cfg: MarketConfig, frm: str, till: str) -> List[str]:
     """Уникальные TRADEDATE из ISS history по одному инструменту, по возрастанию."""
+    memo_key = (cfg.key, frm, till)
+    if memo_key in _TRADING_DATES_MEMO:
+        return _TRADING_DATES_MEMO[memo_key]
     if cfg.key == "futures":
         sample = pick_futures_sample_sec()
     elif cfg.key == "currency":
         sample = "CNYRUB_TOM"
     else:
         sample = "SBER"
-    frm = (report_end - timedelta(days=EOD_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
-    till = report_end.strftime("%Y-%m-%d")
     path = f"/history/engines/{cfg.engine}/markets/{cfg.market}/securities/{sample}.json"
     url = f"{ISS}{path}?{urllib.parse.urlencode({'from': frm, 'till': till, 'iss.meta': 'off'})}"
     data = fetch_json(url)
@@ -532,11 +588,17 @@ def _trading_dates_up_to(cfg: MarketConfig, report_end: date) -> List[str]:
     if not cols or not rows:
         raise RuntimeError("Нет данных календаря торгов.")
     idx = {c: i for i, c in enumerate(cols)}
-    till_s = till
-    dates = sorted({row[idx["TRADEDATE"]] for row in rows if row[idx["TRADEDATE"]] <= till_s})
+    dates = sorted({row[idx["TRADEDATE"]] for row in rows if row[idx["TRADEDATE"]] <= till})
     if len(dates) < 3:
         raise RuntimeError("Недостаточно торговых дней.")
+    _TRADING_DATES_MEMO[memo_key] = dates
     return dates
+
+
+def _trading_dates_up_to(cfg: MarketConfig, report_end: date) -> List[str]:
+    frm = (report_end - timedelta(days=EOD_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    till = report_end.strftime("%Y-%m-%d")
+    return _trading_dates_between(cfg, frm, till)
 
 
 def get_three_trading_days(cfg: MarketConfig, report_end: date) -> Tuple[str, str, str]:
@@ -659,7 +721,7 @@ def merge_currency_volumes(vol_cache: Dict[str, Dict[str, float]]) -> Dict[str, 
 
 
 def live_securities_meta(cfg: MarketConfig) -> Dict[str, Any]:
-    """Список инструментов для «Текущих данных» (только таблица securities, с постраничным обходом)."""
+    """Справочник инструментов для «Текущих данных» (только securities, постранично)."""
     if cfg.key == "currency":
         sec_cols = "SECID,SHORTNAME,SECNAME,BOARDID"
     elif cfg.key == "futures":
@@ -704,56 +766,80 @@ def live_securities_meta(cfg: MarketConfig) -> Dict[str, Any]:
     return meta
 
 
-def fetch_iss_instrument_marketdata_live(cfg: MarketConfig, secid: str) -> Optional[Dict[str, Any]]:
-    """
-    Рыночные данные по одному инструменту — тот же ISS-запрос, что использует карточка на moex.com
-    (см. moex_public_instrument_card_url): .../securities/<SECID>.json
-    """
-    q = urllib.parse.urlencode(
-        {
-            "iss.meta": "off",
-            "marketdata.columns": "SECID,BOARDID,LAST,MARKETPRICE,LCURRENTPRICE,WAPRICE,VALTODAY_RUR,VALTODAY,VALUE,NUMTRADES",
-        }
-    )
-    path = f"/engines/{cfg.engine}/markets/{cfg.market}/securities/{urllib.parse.quote(secid, safe='')}.json"
-    url = f"{ISS}{path}?{q}"
-    try:
-        data = fetch_json(url, timeout=45.0, retries=3)
-    except urllib.error.HTTPError:
-        return None
-    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError, ValueError, json.JSONDecodeError):
-        return None
-    mcols = data.get("marketdata", {}).get("columns") or []
-    _, md_rows = iss_table_rows(data, "marketdata")
-    if not mcols or not md_rows:
-        return None
-    mi = {c: i for i, c in enumerate(mcols)}
+def _merge_marketdata_rows(
+    cfg: MarketConfig,
+    mcols: List[str],
+    md_rows: List[List[Any]],
+    allowed_secids: Optional[Set[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Строки marketdata ISS → словарь по SECID (доска из live_boards)."""
+    mi = {c: i for i, c in enumerate(mcols)} if mcols else {}
+    by_sec: Dict[str, Dict[str, Any]] = {}
+    if not mi or not md_rows:
+        return by_sec
     for row in md_rows:
         bid = row[mi["BOARDID"]]
         if bid not in cfg.live_boards:
             continue
-        return {mcols[i]: row[i] for i in range(len(mcols))}
-    return None
+        sid = row[mi["SECID"]]
+        if allowed_secids is not None and sid not in allowed_secids:
+            continue
+        by_sec[sid] = {mcols[i]: row[i] for i in range(len(mcols))}
+    return by_sec
+
+
+def fetch_live_marketdata_batch(
+    cfg: MarketConfig, sec_ids: List[str]
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Онлайн-снимок marketdata по списку SECID (один ISS-запрос на батч).
+
+    Источник: ISS engines/.../securities.json, таблица marketdata — текущая торговая сессия
+    (LAST, MARKETPRICE, LCURRENTPRICE, WAPRICE, объёмы); фильтр securities= задаёт инструменты.
+    """
+    if not sec_ids:
+        return {}
+    allowed = set(sec_ids)
+    q = urllib.parse.urlencode(
+        {
+            "iss.meta": "off",
+            "securities": ",".join(sec_ids),
+            "securities.columns": "SECID,BOARDID",
+            "marketdata.columns": "SECID,BOARDID,LAST,MARKETPRICE,LCURRENTPRICE,WAPRICE,VALTODAY_RUR,VALTODAY,VALUE,NUMTRADES",
+        }
+    )
+    url = f"{ISS}/engines/{cfg.engine}/markets/{cfg.market}/securities.json?{q}"
+    data = fetch_json_live(url)
+    mcols = data.get("marketdata", {}).get("columns") or []
+    _, md_rows = iss_table_rows(data, "marketdata")
+    return _merge_marketdata_rows(cfg, mcols, md_rows, allowed_secids=allowed)
 
 
 def live_market_block(cfg: MarketConfig) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-    """«Текущие данные»: котировки — отдельный ISS-запрос на каждый инструмент (параллельно)."""
+    """
+    «Текущие данные»: онлайн marketdata ISS на момент запроса актуализации.
+
+    Рыночные поля — батчами (securities=…) через fetch_json_live; несколько батчей параллельно.
+    """
     meta = live_securities_meta(cfg)
     secids = list(meta.keys())
     by_sec: Dict[str, Dict[str, Any]] = {}
     if not secids:
         return by_sec, meta
-    workers = min(32, max(8, len(secids) // 100 + 8))
+    chunks: List[List[str]] = [
+        secids[i : i + LIVE_MARKETDATA_CHUNK] for i in range(0, len(secids), LIVE_MARKETDATA_CHUNK)
+    ]
+    workers = min(LIVE_MARKETDATA_MAX_WORKERS, len(chunks))
+    if workers < 1:
+        workers = 1
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(fetch_iss_instrument_marketdata_live, cfg, sid): sid for sid in secids}
+        futs = [ex.submit(fetch_live_marketdata_batch, cfg, ch) for ch in chunks]
         for fut in as_completed(futs):
-            sid = futs[fut]
             try:
-                md = fut.result()
+                part = fut.result()
             except Exception:
                 continue
-            if md:
-                by_sec[sid] = md
+            by_sec.update(part)
     return by_sec, meta
 
 
@@ -933,15 +1019,22 @@ def build_table_rows(
 
 
 def collect_eod_report_dates(stock_cfg: MarketConfig, today: date, max_sessions: int) -> List[str]:
-    """Уникальные торговые даты отчёта (ed0), новые первыми — последняя завершённая сессия с ценами в истории."""
+    """Уникальные торговые даты отчёта (ed0), новые первыми — без сотен вызовов get_three_trading_days."""
+    frm = (today - timedelta(days=EOD_LOOKBACK_DAYS + 120)).strftime("%Y-%m-%d")
+    till = today.strftime("%Y-%m-%d")
+    try:
+        all_td = _trading_dates_between(stock_cfg, frm, till)
+    except RuntimeError:
+        return []
     out: List[str] = []
     seen: set = set()
     for delta in range(EOD_LOOKBACK_DAYS + 60):
         d = today - timedelta(days=delta)
-        try:
-            ed0, _, _ = get_three_trading_days(stock_cfg, d)
-        except RuntimeError:
+        ds = d.strftime("%Y-%m-%d")
+        i = bisect.bisect_right(all_td, ds) - 1
+        if i < 0:
             continue
+        ed0 = all_td[i]
         if ed0 not in seen:
             seen.add(ed0)
             out.append(ed0)
@@ -950,7 +1043,81 @@ def collect_eod_report_dates(stock_cfg: MarketConfig, today: date, max_sessions:
     return out
 
 
+def _build_market_report_slice(
+    key: str,
+    cfg: MarketConfig,
+    today: date,
+    eod_candidates: List[str],
+    stock_lim: Dict[str, float],
+    cur_lim: Dict[str, float],
+    fut_lim: Dict[str, float],
+    cur_assets: List[str],
+    vol_cache: Dict[str, Dict[str, float]],
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Один рынок: «Текущие данные» + «Итоги» (для параллельного запуска)."""
+    d0, d1, d2 = get_three_trading_days(cfg, today)
+    ref1, ref2 = live_comparison_close_dates(cfg, today)
+    h1 = load_history_cached(cfg, ref1)
+    h2 = load_history_cached(cfg, ref2)
+    md_map, meta = live_market_block(cfg)
+    current_entry = {
+        "title": cfg.title,
+        "basis": (
+            f"Сравнение с ценами закрытия за {ref1} и {ref2}. "
+            f"Текущие котировки — онлайн marketdata ISS (батчи по списку SECID, снимок на момент запроса)."
+        ),
+        "rows": build_table_rows(
+            cfg,
+            "live",
+            d0,
+            d1,
+            d2,
+            stock_lim,
+            cur_lim,
+            fut_lim,
+            cur_assets,
+            vol_cache,
+            h1=h1,
+            h2=h2,
+            md_map=md_map,
+            meta=meta,
+        ),
+    }
+    eod_by_date: Dict[str, Any] = {}
+    for ed0 in eod_candidates:
+        if len(eod_by_date) >= EOD_DAYS_TO_SHOW:
+            break
+        try:
+            ed0a, ed1, ed2 = get_three_trading_days(cfg, date.fromisoformat(ed0))
+        except (RuntimeError, ValueError):
+            continue
+        if ed0a != ed0:
+            continue
+        try:
+            rows = build_table_rows(
+                cfg,
+                "eod",
+                ed0,
+                ed1,
+                ed2,
+                stock_lim,
+                cur_lim,
+                fut_lim,
+                cur_assets,
+                vol_cache,
+            )
+        except Exception:
+            continue
+        eod_by_date[ed0] = {
+            "trading_dates": {"report": ed0, "minus1d": ed1, "minus2d": ed2},
+            "rows": rows,
+        }
+    eod_entry = {"title": cfg.title, "by_date": eod_by_date}
+    return key, current_entry, eod_entry
+
+
 def generate_report() -> Path:
+    _TRADING_DATES_MEMO.clear()
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     stock_lim = load_risk_limits_stock()
     cur_lim = load_risk_limits_currency()
@@ -964,68 +1131,26 @@ def generate_report() -> Path:
 
     current_data: Dict[str, Any] = {}
     eod_data: Dict[str, Any] = {}
-
-    for key, cfg in MARKETS.items():
-        d0, d1, d2 = get_three_trading_days(cfg, today)
-        ref1, ref2 = live_comparison_close_dates(cfg, today)
-        h1 = load_history_cached(cfg, ref1)
-        h2 = load_history_cached(cfg, ref2)
-        md_map, meta = live_market_block(cfg)
-        current_data[key] = {
-            "title": cfg.title,
-            "basis": (
-                f"Сравнение с ценами закрытия за {ref1} и {ref2}. "
-                f"Текущие котировки — отдельный запрос рыночных данных ISS по каждому инструменту "
-                f"(как на карточке на moex.com)."
-            ),
-            "rows": build_table_rows(
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futs = [
+            ex.submit(
+                _build_market_report_slice,
+                k,
                 cfg,
-                "live",
-                d0,
-                d1,
-                d2,
+                today,
+                eod_candidates,
                 stock_lim,
                 cur_lim,
                 fut_lim,
                 cur_assets,
                 vol_cache,
-                h1=h1,
-                h2=h2,
-                md_map=md_map,
-                meta=meta,
-            ),
-        }
-
-        eod_by_date: Dict[str, Any] = {}
-        for ed0 in eod_candidates:
-            if len(eod_by_date) >= EOD_DAYS_TO_SHOW:
-                break
-            try:
-                ed0a, ed1, ed2 = get_three_trading_days(cfg, date.fromisoformat(ed0))
-            except (RuntimeError, ValueError):
-                continue
-            if ed0a != ed0:
-                continue
-            try:
-                rows = build_table_rows(
-                    cfg,
-                    "eod",
-                    ed0,
-                    ed1,
-                    ed2,
-                    stock_lim,
-                    cur_lim,
-                    fut_lim,
-                    cur_assets,
-                    vol_cache,
-                )
-            except Exception:
-                continue
-            eod_by_date[ed0] = {
-                "trading_dates": {"report": ed0, "minus1d": ed1, "minus2d": ed2},
-                "rows": rows,
-            }
-        eod_data[key] = {"title": cfg.title, "by_date": eod_by_date}
+            )
+            for k, cfg in MARKETS.items()
+        ]
+        for fut in as_completed(futs):
+            key, cur, eod = fut.result()
+            current_data[key] = cur
+            eod_data[key] = eod
 
     all_eod: List[str] = []
     for _m in eod_data.values():
