@@ -6,6 +6,10 @@
 Запуск: python moex_risk_monitor.py
 Создаются moex_report.html и moex_report_data.json в этой папке; открывается HTML в браузере.
 
+В блоке «Текущие данные» котировки запрашиваются отдельным вызовом ISS по каждому инструменту
+(/engines/.../securities/<SECID>.json), как на карточке инструмента на moex.com; блок
+«Итоги торгового дня» строится по истории закрытий без изменений.
+
 Ставки риска 1 ур.: публичные таблицы RMS MOEX ISS (im1 для фондового и валютного рынков,
 mr1 для срочного) — те же значения, что публикуются в статических риск-параметрах НКЦ
 (https://www.nationalclearingcentre.ru/), в машиночитаемом виде доступны через ISS.
@@ -64,6 +68,16 @@ def fetch_text(url: str, timeout: float = 30.0) -> str:
 def moex_contract_page_url(shortname: str) -> str:
     code = (shortname or "").strip().lower()
     return f"{MOEX_CONTRACT_PAGE}?{urllib.parse.urlencode({'code': code})}"
+
+
+def moex_public_instrument_card_url(cfg: MarketConfig, secid: str) -> str:
+    """Публичная страница инструмента на moex.com (акции TQBR, валюта CETS TOM, фьючерсы по SECID)."""
+    sid = (secid or "").strip()
+    if cfg.key == "stock":
+        return f"https://www.moex.com/ru/issue.aspx?{urllib.parse.urlencode({'board': 'TQBR', 'code': sid})}"
+    if cfg.key == "currency":
+        return f"https://www.moex.com/ru/issue/{sid}/CETS"
+    return f"{MOEX_CONTRACT_PAGE}?{urllib.parse.urlencode({'code': sid})}"
 
 
 def parse_moex_contract_title(html: str) -> Optional[str]:
@@ -644,62 +658,107 @@ def merge_currency_volumes(vol_cache: Dict[str, Dict[str, float]]) -> Dict[str, 
     return vol_cache
 
 
-def live_market_block(cfg: MarketConfig) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+def live_securities_meta(cfg: MarketConfig) -> Dict[str, Any]:
+    """Список инструментов для «Текущих данных» (только таблица securities, с постраничным обходом)."""
     if cfg.key == "currency":
         sec_cols = "SECID,SHORTNAME,SECNAME,BOARDID"
     elif cfg.key == "futures":
         sec_cols = "SECID,SHORTNAME,SECNAME,BOARDID,ASSETCODE"
     else:
         sec_cols = "SECID,SHORTNAME,SECNAME,BOARDID"
+    meta: Dict[str, Any] = {}
+    start = 0
+    while True:
+        q = urllib.parse.urlencode(
+            {"iss.meta": "off", "start": str(start), "securities.columns": sec_cols}
+        )
+        data = fetch_json(f"{ISS}/engines/{cfg.engine}/markets/{cfg.market}/securities.json?{q}")
+        _, sec_rows = iss_table_rows(data, "securities")
+        if not sec_rows:
+            break
+        scols = data["securities"]["columns"]
+        si = {c: i for i, c in enumerate(scols)}
+        for row in sec_rows:
+            sid = row[si["SECID"]]
+            bid = row[si["BOARDID"]]
+            if bid not in cfg.live_boards:
+                continue
+            if cfg.key == "stock" and bid != "TQBR":
+                continue
+            sn = row[si["SHORTNAME"]]
+            ac = row[si["ASSETCODE"]] if "ASSETCODE" in si else None
+            sen = row[si["SECNAME"]] if "SECNAME" in si else ""
+            if cfg.key == "currency" and not is_currency_tom(sid):
+                continue
+            if cfg.key == "futures" and not is_futures_contract(str(sn), ac):
+                continue
+            if cfg.key == "currency":
+                meta[sid] = {"SHORTNAME": sn, "SECNAME": sen}
+            elif cfg.key == "futures":
+                meta[sid] = {"SHORTNAME": sn, "SECNAME": sen, "ASSETCODE": ac}
+            else:
+                meta[sid] = {"SHORTNAME": sn, "SECNAME": sen}
+        if len(sec_rows) < PAGESIZE:
+            break
+        start += PAGESIZE
+    return meta
+
+
+def fetch_iss_instrument_marketdata_live(cfg: MarketConfig, secid: str) -> Optional[Dict[str, Any]]:
+    """
+    Рыночные данные по одному инструменту — тот же ISS-запрос, что использует карточка на moex.com
+    (см. moex_public_instrument_card_url): .../securities/<SECID>.json
+    """
     q = urllib.parse.urlencode(
         {
             "iss.meta": "off",
-            "securities.columns": sec_cols,
             "marketdata.columns": "SECID,BOARDID,LAST,MARKETPRICE,LCURRENTPRICE,WAPRICE,VALTODAY_RUR,VALTODAY,VALUE,NUMTRADES",
         }
     )
-    data = fetch_json(f"{ISS}/engines/{cfg.engine}/markets/{cfg.market}/securities.json?{q}")
+    path = f"/engines/{cfg.engine}/markets/{cfg.market}/securities/{urllib.parse.quote(secid, safe='')}.json"
+    url = f"{ISS}{path}?{q}"
+    try:
+        data = fetch_json(url, timeout=45.0, retries=3)
+    except urllib.error.HTTPError:
+        return None
+    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError, ValueError, json.JSONDecodeError):
+        return None
     mcols = data.get("marketdata", {}).get("columns") or []
     _, md_rows = iss_table_rows(data, "marketdata")
+    if not mcols or not md_rows:
+        return None
     mi = {c: i for i, c in enumerate(mcols)}
-    scols = data["securities"]["columns"]
-    _, sec_rows = iss_table_rows(data, "securities")
-    si = {c: i for i, c in enumerate(scols)}
-    meta: Dict[str, Any] = {}
-    for row in sec_rows:
-        sid = row[si["SECID"]]
-        bid = row[si["BOARDID"]]
-        if bid not in cfg.live_boards:
-            continue
-        if cfg.key == "stock" and bid != "TQBR":
-            continue
-        sn = row[si["SHORTNAME"]]
-        ac = row[si["ASSETCODE"]] if "ASSETCODE" in si else None
-        sen = row[si["SECNAME"]] if "SECNAME" in si else ""
-        if cfg.key == "currency" and not is_currency_tom(sid):
-            continue
-        if cfg.key == "futures" and not is_futures_contract(str(sn), ac):
-            continue
-        if cfg.key == "currency":
-            meta[sid] = {"SHORTNAME": sn, "SECNAME": sen}
-        elif cfg.key == "futures":
-            meta[sid] = {"SHORTNAME": sn, "SECNAME": sen, "ASSETCODE": ac}
-        else:
-            meta[sid] = {"SHORTNAME": sn, "SECNAME": sen}
-    by_sec: Dict[str, Dict[str, Any]] = {}
     for row in md_rows:
         bid = row[mi["BOARDID"]]
         if bid not in cfg.live_boards:
             continue
-        sid = row[mi["SECID"]]
-        if sid not in meta:
-            continue
-        by_sec[sid] = {mcols[i]: row[i] for i in range(len(mcols))}
+        return {mcols[i]: row[i] for i in range(len(mcols))}
+    return None
+
+
+def live_market_block(cfg: MarketConfig) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """«Текущие данные»: котировки — отдельный ISS-запрос на каждый инструмент (параллельно)."""
+    meta = live_securities_meta(cfg)
+    secids = list(meta.keys())
+    by_sec: Dict[str, Dict[str, Any]] = {}
+    if not secids:
+        return by_sec, meta
+    workers = min(32, max(8, len(secids) // 100 + 8))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(fetch_iss_instrument_marketdata_live, cfg, sid): sid for sid in secids}
+        for fut in as_completed(futs):
+            sid = futs[fut]
+            try:
+                md = fut.result()
+            except Exception:
+                continue
+            if md:
+                by_sec[sid] = md
     return by_sec, meta
 
 
 def current_price_live(md: Dict[str, Any]) -> Optional[float]:
-    for key in ("MARKETPRICE", "LAST", "LCURRENTPRICE", "WAPRICE"):
+    for key in ("LAST", "MARKETPRICE", "LCURRENTPRICE", "WAPRICE"):
         v = md.get(key)
         if v is not None:
             try:
@@ -914,7 +973,11 @@ def generate_report() -> Path:
         md_map, meta = live_market_block(cfg)
         current_data[key] = {
             "title": cfg.title,
-            "basis": f"Сравнение с ценами закрытия за {ref1} и {ref2}.",
+            "basis": (
+                f"Сравнение с ценами закрытия за {ref1} и {ref2}. "
+                f"Текущие котировки — отдельный запрос рыночных данных ISS по каждому инструменту "
+                f"(как на карточке на moex.com)."
+            ),
             "rows": build_table_rows(
                 cfg,
                 "live",
