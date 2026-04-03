@@ -14,6 +14,9 @@ MARKETPRICE и др.); запросы батчами по параметру sec
 mr1 для срочного) — те же значения, что публикуются в статических риск-параметрах НКЦ
 (https://www.nationalclearingcentre.ru/), в машиночитаемом виде доступны через ISS.
 Кэш истории: папка moex_cache/; объёмы валют по датам — currency_volume_by_date.json.
+Переменные среды: CI/GitHub Actions — рынки обрабатываются последовательно и общий семафор на HTTP
+к ISS (меньше 429); локально по умолчанию три рынка параллельно. MOEX_PARALLEL_MARKETS=1 в CI
+включает прежнюю параллельность; MOEX_SERIAL_MARKETS=1 локально — последовательно.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import math
 import os
 import re
 import socket
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -41,14 +45,16 @@ MSK_TZ = timezone(timedelta(hours=3))
 
 ISS = "https://iss.moex.com/iss"
 PAGESIZE = 100
+# Постраничная выгрузка истории одной даты: больше limit — меньше HTTP-запросов к ISS.
+HISTORY_PAGE_LIMIT = 500
 EOD_LOOKBACK_DAYS = 45
 # Сколько последних торговых дней с успешно собранными ценами закрытия показывать в «Итогах».
 EOD_DAYS_TO_SHOW = 5
 # Сколько уникальных торговых дней-кандидатов перебрать (с новых к старым), чтобы набрать EOD_DAYS_TO_SHOW.
 EOD_CANDIDATE_TRADING_DAYS = 28
 # Онлайн-котировки: сколько SECID в одном ISS-запросе marketdata и сколько батчей параллельно.
-LIVE_MARKETDATA_CHUNK = 48
-LIVE_MARKETDATA_MAX_WORKERS = 20
+LIVE_MARKETDATA_CHUNK = 64
+LIVE_MARKETDATA_MAX_WORKERS = 12
 
 # Фьючерс: только краткое имя вида Si-6.26 (без спредов и опционов)
 FUT_NAME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]*)-(\d{1,2})\.(\d{2})$")
@@ -64,11 +70,32 @@ _MOEX_TITLE_CACHE: Optional[Dict[str, str]] = None
 
 # Кэш списков торговых дат за один прогон generate_report (снижает число запросов к ISS).
 _TRADING_DATES_MEMO: Dict[Tuple[str, str, str], List[str]] = {}
+# Кэш загруженной истории в памяти за один прогон (меньше повторных чтений больших JSON).
+_HISTORY_MEMORY: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+# Ограничение одновременных HTTP к ISS/MOEX (снижает 429 и «залипания» на GitHub Actions).
+_ISS_HTTP_SEM = threading.BoundedSemaphore(12)
+_FUT_SAMPLE_SECID: Optional[str] = None
+
+
+def _use_parallel_markets() -> bool:
+    """В CI по умолчанию последовательно — меньше параллельной нагрузки на ISS."""
+    if os.environ.get("MOEX_SERIAL_MARKETS", "").lower() in ("1", "true", "yes"):
+        return False
+    if os.environ.get("MOEX_PARALLEL_MARKETS", "").lower() in ("1", "true", "yes"):
+        return True
+    if os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true":
+        return False
+    return True
+
+
+def _iss_urlopen(req: urllib.request.Request, timeout: float):
+    with _ISS_HTTP_SEM:
+        return urllib.request.urlopen(req, timeout=timeout)
 
 
 def fetch_text(url: str, timeout: float = 30.0) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "moex-risk-monitor/3.0 (report)"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _iss_urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="replace")
 
 
@@ -210,7 +237,7 @@ def fetch_json(url: str, timeout: float = 120.0, retries: int = 4) -> Any:
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "moex-risk-monitor/2.0"})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _iss_urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             last_err = e
@@ -252,7 +279,7 @@ def fetch_json_live(url: str, timeout: float = 60.0, retries: int = 3) -> Any:
                     "Pragma": "no-cache",
                 },
             )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _iss_urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             last_err = e
@@ -467,16 +494,26 @@ def cache_file_history(cfg: MarketConfig, tradedate: str) -> Path:
 
 
 def load_history_cached(cfg: MarketConfig, tradedate: str) -> Dict[str, Dict[str, Any]]:
+    mem_key = (cfg.key, tradedate)
+    if mem_key in _HISTORY_MEMORY:
+        return _HISTORY_MEMORY[mem_key]
     path = cache_file_history(cfg, tradedate)
     if path.is_file():
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        _HISTORY_MEMORY[mem_key] = data
+        return data
     path_part = f"/history/engines/{cfg.engine}/markets/{cfg.market}/securities.json"
     by_sec: Dict[str, Dict[str, Any]] = {}
     start = 0
     while True:
         q = urllib.parse.urlencode(
-            {"date": tradedate, "iss.meta": "off", "start": str(start), "limit": str(PAGESIZE)}
+            {
+                "date": tradedate,
+                "iss.meta": "off",
+                "start": str(start),
+                "limit": str(HISTORY_PAGE_LIMIT),
+            }
         )
         data = fetch_json(f"{ISS}{path_part}?{q}")
         hcols, rows = iss_table_rows(data, "history")
@@ -497,11 +534,12 @@ def load_history_cached(cfg: MarketConfig, tradedate: str) -> Dict[str, Dict[str
                 if not is_futures_contract(str(sn), str(ac) if ac is not None else None):
                     continue
             by_sec[secid] = rec
-        start += PAGESIZE
-        if len(rows) < PAGESIZE:
+        start += HISTORY_PAGE_LIMIT
+        if len(rows) < HISTORY_PAGE_LIMIT:
             break
     with open(path, "w", encoding="utf-8") as f:
         json.dump(by_sec, f, ensure_ascii=False)
+    _HISTORY_MEMORY[mem_key] = by_sec
     return by_sec
 
 
@@ -549,6 +587,9 @@ def volume_rub_from_history(rec: Dict[str, Any], engine: str) -> Optional[float]
 
 
 def pick_futures_sample_sec() -> str:
+    global _FUT_SAMPLE_SECID
+    if _FUT_SAMPLE_SECID is not None:
+        return _FUT_SAMPLE_SECID
     start = 0
     while start < 3000:
         data = fetch_json(
@@ -562,11 +603,13 @@ def pick_futures_sample_sec() -> str:
             break
         for r in rows:
             if len(r) >= 2 and FUT_NAME_RE.match(str(r[1] or "")):
-                return str(r[0])
+                _FUT_SAMPLE_SECID = str(r[0])
+                return _FUT_SAMPLE_SECID
         start += 100
         if len(rows) < 100:
             break
-    return "SiM6"
+    _FUT_SAMPLE_SECID = "SiM6"
+    return _FUT_SAMPLE_SECID
 
 
 def _trading_dates_between(cfg: MarketConfig, frm: str, till: str) -> List[str]:
@@ -1118,6 +1161,7 @@ def _build_market_report_slice(
 
 def generate_report() -> Path:
     _TRADING_DATES_MEMO.clear()
+    _HISTORY_MEMORY.clear()
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     stock_lim = load_risk_limits_stock()
     cur_lim = load_risk_limits_currency()
@@ -1131,10 +1175,31 @@ def generate_report() -> Path:
 
     current_data: Dict[str, Any] = {}
     eod_data: Dict[str, Any] = {}
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        futs = [
-            ex.submit(
-                _build_market_report_slice,
+    market_items = list(MARKETS.items())
+    if _use_parallel_markets():
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            futs = [
+                ex.submit(
+                    _build_market_report_slice,
+                    k,
+                    cfg,
+                    today,
+                    eod_candidates,
+                    stock_lim,
+                    cur_lim,
+                    fut_lim,
+                    cur_assets,
+                    vol_cache,
+                )
+                for k, cfg in market_items
+            ]
+            for fut in as_completed(futs):
+                key, cur, eod = fut.result()
+                current_data[key] = cur
+                eod_data[key] = eod
+    else:
+        for k, cfg in market_items:
+            key, cur, eod = _build_market_report_slice(
                 k,
                 cfg,
                 today,
@@ -1145,10 +1210,6 @@ def generate_report() -> Path:
                 cur_assets,
                 vol_cache,
             )
-            for k, cfg in MARKETS.items()
-        ]
-        for fut in as_completed(futs):
-            key, cur, eod = fut.result()
             current_data[key] = cur
             eod_data[key] = eod
 
