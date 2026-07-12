@@ -9,7 +9,11 @@
 Ставки риска 1 ур.: публичные таблицы RMS MOEX ISS (im1 для фондового и валютного рынков,
 mr1 для срочного) — те же значения, что публикуются в статических риск-параметрах НКЦ
 (https://www.nationalclearingcentre.ru/), в машиночитаемом виде доступны через ISS.
-Кэш истории: папка moex_cache/; объёмы валют по датам — currency_volume_by_date.json.
+Кэш истории: папка moex_cache/; объёмы валют по датам — currency_volume_by_date.json;
+медианы оборотов для лимитов концентрации — conc_vol_medians_v2.json.
+
+«Лимиты концентрации»: расчётный ЛК по медианам дневного оборота (год / 3 мес.),
+текущие ЛК — limit1/limit2 (фондовый) и lk1/lk2 (срочный) из RMS ISS (НКЦ).
 
 «Текущие данные»: таблица marketdata ISS — в первую очередь поле LAST (цена последней сделки на момент
 запроса); при отсутствии сделок — лучшие BID/OFFER из стакана; далее LCURRENTPRICE и др. Запрос без кэша.
@@ -40,10 +44,10 @@ MSK_TZ = timezone(timedelta(hours=3))
 ISS = "https://iss.moex.com/iss"
 PAGESIZE = 100
 EOD_LOOKBACK_DAYS = 45
-# Сколько последних торговых дней с успешно собранными ценами закрытия показывать в «Итогах».
-EOD_DAYS_TO_SHOW = 5
-# Сколько уникальных торговых дней-кандидатов перебрать (с новых к старым), чтобы набрать EOD_DAYS_TO_SHOW.
-EOD_CANDIDATE_TRADING_DAYS = 28
+# Итоги торгового дня: календарное окно «последний месяц» для выбора даты.
+EOD_MONTH_CALENDAR_DAYS = 31
+# ~1 календарный месяц в торговых сессиях для колонки «1м, %».
+TRADING_SESSIONS_1M = 21
 
 # Фьючерс: только краткое имя вида Si-6.26 (без спредов и опционов)
 FUT_NAME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]*)-(\d{1,2})\.(\d{2})$")
@@ -281,16 +285,30 @@ def paginate_iss(path: str, table: str, extra: Optional[Dict[str, str]] = None) 
 
 def load_risk_limits_stock() -> Dict[str, float]:
     """Ставка риска 1 ур. (im1) по инструменту (SECID)."""
+    risk, _ = load_stock_limits_combined()
+    return risk
+
+
+def load_stock_limits_combined() -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
+    """Один запрос RMS: im1 для мониторинга риска и limit1/limit2 для лимитов концентрации."""
     rows = paginate_iss("/rms/engines/stock/objects/limits.json", "limits")
-    m: Dict[str, float] = {}
+    risk: Dict[str, float] = {}
+    conc: Dict[str, Dict[str, Any]] = {}
     for r in rows:
-        if len(r) < 5:
+        if len(r) < 8:
+            continue
+        secid = str(r[1])
+        if str(r[2]) != "SUR" or secid.endswith("-RM"):
             continue
         try:
-            m[str(r[1])] = float(r[3]) / 100.0
+            im1 = float(r[3])
+            risk[secid] = im1 / 100.0
+            if im1 >= 100:
+                continue
+            conc[secid] = {"limit1": float(r[6]), "limit2": float(r[7]), "im1": im1}
         except (TypeError, ValueError):
             continue
-    return m
+    return risk, conc
 
 
 def load_risk_limits_currency() -> Dict[str, float]:
@@ -311,16 +329,409 @@ def load_risk_limits_currency() -> Dict[str, float]:
 
 def load_risk_limits_futures() -> Dict[str, float]:
     """Ставка риска 1 ур. (mr1) по коду базового актива (ASSETCODE)."""
+    risk, _ = load_futures_limits_combined()
+    return risk
+
+
+def load_futures_limits_combined() -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
+    """Один запрос RMS: mr1 и lk1/lk2 (как на сайте НКЦ)."""
     rows = paginate_iss("/rms/engines/futures/objects/limits.json", "limits")
-    m: Dict[str, float] = {}
+    risk: Dict[str, float] = {}
+    conc: Dict[str, Dict[str, Any]] = {}
     for r in rows:
-        if len(r) < 5:
+        if len(r) < 9:
             continue
+        asset = str(r[1])
         try:
-            m[str(r[1])] = float(r[2])
+            mr1 = float(r[2])
+            risk[asset] = mr1
+            if mr1 >= 1.0 - 1e-9:
+                continue
+            conc[asset] = {
+                "lk1": float(r[5]),
+                "lk2": float(r[6]),
+                "mr1": mr1,
+                "title": str(r[7] or ""),
+                "group_title": str(r[8] or ""),
+            }
         except (TypeError, ValueError):
             continue
-    return m
+    return risk, conc
+
+
+CONC_YEAR_CALENDAR_DAYS = 400
+CONC_3M_CALENDAR_DAYS = 110
+CONC_MEDIAN_CACHE_FILE = CACHE_DIR / f"conc_vol_medians_{CACHE_VER}.json"
+
+_CALENDAR_CACHE: Dict[str, List[str]] = {}
+
+
+def load_concentration_limits_stock() -> Dict[str, Dict[str, Any]]:
+    _, conc = load_stock_limits_combined()
+    return conc
+
+
+def load_concentration_limits_futures() -> Dict[str, Dict[str, Any]]:
+    _, conc = load_futures_limits_combined()
+    return conc
+
+
+def futures_expiry_date(shortname: str) -> Optional[date]:
+    exp = parse_futures_expiry_mmyy(shortname)
+    if not exp:
+        return None
+    year, mon = exp
+    from calendar import monthrange
+
+    return date(year, mon, monthrange(year, mon)[1])
+
+
+def adjusted_price(
+    price: Optional[float],
+    lot_volume: float,
+    min_step: float,
+    step_price: Optional[float],
+) -> Optional[float]:
+    if price is None or price <= 0 or lot_volume <= 0 or min_step <= 0:
+        return None
+    sp = step_price if step_price is not None and step_price > 0 else min_step
+    return (price * sp) / (lot_volume * min_step)
+
+
+def stat_median(values: List[float]) -> Optional[float]:
+    vals = sorted(v for v in values if v is not None and v > 0)
+    if not vals:
+        return None
+    n = len(vals)
+    mid = n // 2
+    if n % 2:
+        return vals[mid]
+    return (vals[mid - 1] + vals[mid]) / 2.0
+
+
+def extended_trading_dates(cfg: MarketConfig, end: date, calendar_lookback: int) -> List[str]:
+    if cfg.key == "futures":
+        sample = pick_futures_sample_sec()
+    elif cfg.key == "currency":
+        sample = "CNYRUB_TOM"
+    else:
+        sample = "SBER"
+    frm = (end - timedelta(days=calendar_lookback)).strftime("%Y-%m-%d")
+    till = end.strftime("%Y-%m-%d")
+    path = f"/history/engines/{cfg.engine}/markets/{cfg.market}/securities/{sample}.json"
+    dates: set = set()
+    start = 0
+    while True:
+        q = urllib.parse.urlencode({"from": frm, "till": till, "iss.meta": "off", "start": str(start), "limit": "100"})
+        data = fetch_json(f"{ISS}{path}?{q}")
+        _, rows = iss_table_rows(data, "history")
+        cols = data.get("history", {}).get("columns") or []
+        if not cols or not rows:
+            break
+        idx = {c: i for i, c in enumerate(cols)}
+        for row in rows:
+            td = row[idx["TRADEDATE"]]
+            if td <= till:
+                dates.add(td)
+        start += 100
+        if len(rows) < 100:
+            break
+    return sorted(dates)
+
+
+def pick_front_futures_by_asset(hist_by_sec: Dict[str, Dict[str, Any]], trade_day: date) -> Dict[str, Dict[str, Any]]:
+    grouped: Dict[str, List[Tuple[date, Dict[str, Any]]]] = defaultdict(list)
+    for rec in hist_by_sec.values():
+        sn = str(rec.get("SHORTNAME") or "")
+        ac = rec.get("ASSETCODE")
+        if not is_futures_contract(sn, str(ac) if ac is not None else None):
+            continue
+        exp_d = futures_expiry_date(sn)
+        if exp_d is None or exp_d < trade_day:
+            continue
+        grouped[str(ac)].append((exp_d, rec))
+    out: Dict[str, Dict[str, Any]] = {}
+    for ac, items in grouped.items():
+        out[ac] = min(items, key=lambda x: (x[0], str(x[1].get("SECID") or "")))[1]
+    return out
+
+
+def load_stock_lot_specs(secids: Iterable[str]) -> Dict[str, Dict[str, float]]:
+    want = sorted({str(s) for s in secids})
+    out: Dict[str, Dict[str, float]] = {}
+    batch = 50
+    for i in range(0, len(want), batch):
+        chunk = want[i : i + batch]
+        q = urllib.parse.urlencode(
+            {
+                "iss.meta": "off",
+                "securities": ",".join(chunk),
+                "securities.columns": "SECID,LOTSIZE,MINSTEP,BOARDID",
+            }
+        )
+        data = fetch_json(f"{ISS}/engines/stock/markets/shares/securities.json?{q}")
+        cols = data.get("securities", {}).get("columns") or []
+        _, rows = iss_table_rows(data, "securities")
+        if not cols:
+            continue
+        si = {c: j for j, c in enumerate(cols)}
+        for row in rows:
+            if "BOARDID" in si and row[si["BOARDID"]] != "TQBR":
+                continue
+            sid = str(row[si["SECID"]])
+            try:
+                lot = float(row[si["LOTSIZE"]]) if "LOTSIZE" in si else 1.0
+                step = float(row[si["MINSTEP"]]) if "MINSTEP" in si else 0.01
+            except (TypeError, ValueError):
+                lot, step = 1.0, 0.01
+            out[sid] = {"lot_volume": lot if lot > 0 else 1.0, "min_step": step if step > 0 else 0.01}
+    return out
+
+
+def load_futures_lot_specs(secids: Iterable[str]) -> Dict[str, Dict[str, float]]:
+    store = load_futures_secmeta_for(secids)
+    out: Dict[str, Dict[str, float]] = {}
+    batch = 40
+    want = sorted({str(s) for s in secids})
+    for i in range(0, len(want), batch):
+        chunk = want[i : i + batch]
+        q = urllib.parse.urlencode(
+            {
+                "iss.meta": "off",
+                "securities": ",".join(chunk),
+                "securities.columns": "SECID,LOTVOLUME,MINSTEP,STEPPRICE",
+            }
+        )
+        data = fetch_json(f"{ISS}/engines/futures/markets/forts/securities.json?{q}")
+        cols = data.get("securities", {}).get("columns") or []
+        _, rows = iss_table_rows(data, "securities")
+        if not cols:
+            continue
+        si = {c: j for j, c in enumerate(cols)}
+        for row in rows:
+            sid = str(row[si["SECID"]])
+            try:
+                out[sid] = {
+                    "lot_volume": max(float(row[si["LOTVOLUME"]]), 1.0),
+                    "min_step": max(float(row[si["MINSTEP"]]), 1e-9),
+                    "step_price": max(float(row[si["STEPPRICE"]]), 1e-9),
+                }
+            except (TypeError, ValueError):
+                meta = store.get(sid, {})
+                out[sid] = {"lot_volume": 1.0, "min_step": 1.0, "step_price": 1.0}
+    return out
+
+
+def _load_or_build_volume_medians(report_day: str, today: date) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+    if CONC_MEDIAN_CACHE_FILE.is_file():
+        with open(CONC_MEDIAN_CACHE_FILE, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        if cached.get("report_day") == report_day:
+            return cached.get("stock") or {}, cached.get("futures") or {}
+
+    stock_cfg = MARKETS["stock"]
+    fut_cfg = MARKETS["futures"]
+    year_dates = extended_trading_dates(stock_cfg, date.fromisoformat(report_day), CONC_YEAR_CALENDAR_DAYS)
+    if report_day not in year_dates:
+        year_dates = [d for d in year_dates if d <= report_day]
+    three_m_cutoff = (
+        date.fromisoformat(report_day) - timedelta(days=CONC_3M_CALENDAR_DAYS)
+    ).strftime("%Y-%m-%d")
+    dates_3m = [d for d in year_dates if d >= three_m_cutoff]
+
+    stock_vols: Dict[str, List[float]] = defaultdict(list)
+    stock_vols_3m: Dict[str, List[float]] = defaultdict(list)
+    fut_vols: Dict[str, List[float]] = defaultdict(list)
+    fut_vols_3m: Dict[str, List[float]] = defaultdict(list)
+
+    def load_day_pair(d: str) -> None:
+        sh = load_history_cached(stock_cfg, d)
+        for secid, rec in sh.items():
+            vr = volume_rub_from_history(rec, stock_cfg.engine)
+            if vr is not None and vr > 0:
+                stock_vols[secid].append(vr)
+                if d in dates_3m:
+                    stock_vols_3m[secid].append(vr)
+        fh = load_history_cached(fut_cfg, d)
+        front = pick_front_futures_by_asset(fh, date.fromisoformat(d))
+        for ac, rec in front.items():
+            vr = volume_rub_from_history(rec, fut_cfg.engine)
+            if vr is not None and vr > 0:
+                fut_vols[ac].append(vr)
+                if d in dates_3m:
+                    fut_vols_3m[ac].append(vr)
+
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        list(ex.map(load_day_pair, year_dates))
+
+    stock_medians = {
+        sid: {"med_year": stat_median(stock_vols[sid]), "med_3m": stat_median(stock_vols_3m.get(sid, []))}
+        for sid in stock_vols
+    }
+    fut_medians = {
+        ac: {"med_year": stat_median(fut_vols[ac]), "med_3m": stat_median(fut_vols_3m.get(ac, []))}
+        for ac in fut_vols
+    }
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONC_MEDIAN_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            {"report_day": report_day, "stock": stock_medians, "futures": fut_medians},
+            f,
+            ensure_ascii=False,
+        )
+    return stock_medians, fut_medians
+
+
+def calc_lk_from_volumes(med_year: Optional[float], med_3m: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+    parts = [p for p in (med_year, med_3m) if p is not None and p > 0]
+    if not parts:
+        return None, None
+    my = med_year or med_3m or 0.0
+    m3 = med_3m or med_year or 0.0
+    lk2_rub = 0.2 * my + 0.8 * m3
+    lk1_rub = lk2_rub / 5.0
+    return lk1_rub, lk2_rub
+
+
+def futures_lk_to_rub(lk: float, ba_price: Optional[float]) -> Optional[float]:
+    """ЛК в единицах БА → рубли: lk × цена БА."""
+    if ba_price is None or ba_price <= 0:
+        return None
+    return lk * ba_price
+
+
+def conc_row_highlight(delta: Optional[float]) -> str:
+    if delta is None or math.isnan(delta):
+        return ""
+    if abs(delta) <= 10:
+        return ""
+    if delta > 10:
+        return "hl-green"
+    return "hl-yellow-conc"
+
+
+def _conc_row(
+    ticker: str,
+    shortname: str,
+    price: Optional[float],
+    lk1_cur: Optional[float],
+    lk2_cur: Optional[float],
+    lk1_calc: Optional[float],
+    lk2_calc: Optional[float],
+    lk2_cur_rub: Optional[float],
+    lk2_calc_rub: Optional[float],
+) -> Dict[str, Any]:
+    delta: Optional[float] = None
+    if lk2_cur_rub is not None and lk2_cur_rub > 0 and lk2_calc_rub is not None:
+        delta = (lk2_calc_rub - lk2_cur_rub) / lk2_cur_rub * 100.0
+    return {
+        "ticker": ticker,
+        "shortname": shortname,
+        "price": round(price, 2) if price is not None else None,
+        "lk1_cur": round(lk1_cur, 0) if lk1_cur is not None else None,
+        "lk2_cur": round(lk2_cur, 0) if lk2_cur is not None else None,
+        "lk1_calc": round(lk1_calc, 0) if lk1_calc is not None else None,
+        "lk2_calc": round(lk2_calc, 0) if lk2_calc is not None else None,
+        "lk2_cur_rub": round(lk2_cur_rub, 0) if lk2_cur_rub is not None else None,
+        "lk2_calc_rub": round(lk2_calc_rub, 0) if lk2_calc_rub is not None else None,
+        "lk2_delta_pct": round(delta, 1) if delta is not None else None,
+        "hl": conc_row_highlight(delta),
+    }
+
+
+def build_concentration_data(
+    report_day: str,
+    stock_conc: Dict[str, Dict[str, Any]],
+    fut_conc: Dict[str, Dict[str, Any]],
+    stock_medians: Dict[str, Dict[str, float]],
+    fut_medians: Dict[str, Dict[str, float]],
+) -> Dict[str, Any]:
+    stock_cfg = MARKETS["stock"]
+    fut_cfg = MARKETS["futures"]
+    trade_d = date.fromisoformat(report_day)
+
+    stock_hist = load_history_cached(stock_cfg, report_day)
+    fut_hist = load_history_cached(fut_cfg, report_day)
+    front = pick_front_futures_by_asset(fut_hist, trade_d)
+
+    fut_specs = load_futures_lot_specs([rec.get("SECID") for rec in front.values() if rec.get("SECID")])
+
+    stock_rows: List[Dict[str, Any]] = []
+    for secid, lim in stock_conc.items():
+        rec = stock_hist.get(secid)
+        if not rec:
+            continue
+        price = close_from_history_row(rec, stock_cfg.engine)
+        if price is None or price <= 0:
+            continue
+        meds = stock_medians.get(secid, {})
+        lk1_rub, lk2_rub = calc_lk_from_volumes(meds.get("med_year"), meds.get("med_3m"))
+        if lk2_rub is None:
+            continue
+        lk1_calc = lk1_rub / price if lk1_rub else None
+        lk2_calc = lk2_rub / price
+        l1c = lim["limit1"]
+        l2c = lim["limit2"]
+        stock_rows.append(
+            _conc_row(
+                secid,
+                str(rec.get("SHORTNAME") or secid),
+                price,
+                l1c,
+                l2c,
+                lk1_calc,
+                lk2_calc,
+                l2c * price,
+                lk2_rub,
+            )
+        )
+
+    fut_rows: List[Dict[str, Any]] = []
+    for ac, lim in fut_conc.items():
+        if lim.get("group_title") == "Акции":
+            continue
+        rec = front.get(ac)
+        if not rec:
+            continue
+        secid = str(rec.get("SECID") or "")
+        settle = close_from_history_row(rec, fut_cfg.engine)
+        spec = fut_specs.get(secid, {"lot_volume": 1.0, "min_step": 1.0, "step_price": 1.0})
+        ba_price = adjusted_price(
+            settle, spec["lot_volume"], spec["min_step"], spec["step_price"]
+        )
+        if ba_price is None:
+            continue
+        meds = fut_medians.get(ac, {})
+        lk1_rub, lk2_rub = calc_lk_from_volumes(meds.get("med_year"), meds.get("med_3m"))
+        if lk2_rub is None:
+            continue
+        lk1_calc = lk1_rub / ba_price if lk1_rub else None
+        lk2_calc = lk2_rub / ba_price
+        l1c = lim["lk1"]
+        l2c = lim["lk2"]
+        lk2_cur_rub = futures_lk_to_rub(l2c, ba_price)
+        disp = (lim.get("title") or ac).strip()
+        fut_rows.append(
+            _conc_row(
+                ac,
+                disp,
+                ba_price,
+                l1c,
+                l2c,
+                lk1_calc,
+                lk2_calc,
+                lk2_cur_rub,
+                lk2_rub,
+            )
+        )
+
+    stock_rows.sort(key=lambda r: abs(r.get("lk2_delta_pct") or 0), reverse=True)
+    fut_rows.sort(key=lambda r: abs(r.get("lk2_delta_pct") or 0), reverse=True)
+    return {
+        "report_day": report_day,
+        "stock": {"title": "Фондовый рынок", "rows": stock_rows},
+        "futures": {"title": "Срочный рынок", "rows": fut_rows},
+    }
 
 
 def parse_futures_expiry_mmyy(shortname: str) -> Optional[Tuple[int, int]]:
@@ -613,12 +1024,30 @@ def row_highlight(r1: Optional[float], r2: Optional[float]) -> str:
         return ""
     m = max(vals)
     if m >= 100:
-        return "hl-crimson"
-    if m >= 80:
         return "hl-red"
     if m >= 50:
         return "hl-yellow"
     return ""
+
+
+def trading_dates_cached(cfg: MarketConfig, end: date, lookback: int = EOD_LOOKBACK_DAYS + 20) -> List[str]:
+    key = f"{cfg.key}:{end.isoformat()}:{lookback}"
+    if key not in _CALENDAR_CACHE:
+        _CALENDAR_CACHE[key] = extended_trading_dates(cfg, end, lookback)
+    return _CALENDAR_CACHE[key]
+
+
+def trading_day_offset(cfg: MarketConfig, anchor: str, sessions_back: int) -> Optional[str]:
+    """anchor — торговая дата; sessions_back=5 → пятый предыдущий торговый день."""
+    dates = trading_dates_cached(cfg, date.fromisoformat(anchor))
+    candidates = [d for d in dates if d <= anchor]
+    if not candidates:
+        return None
+    anchor_day = candidates[-1]
+    idx = dates.index(anchor_day) - sessions_back
+    if idx < 0:
+        return None
+    return dates[idx]
 
 
 def ratio_pct(change_pct: Optional[float], risk: Optional[float]) -> Optional[float]:
@@ -807,17 +1236,27 @@ def build_table_rows(
     vol_cache: Dict[str, Dict[str, float]],
     h1: Optional[Dict[str, Dict[str, Any]]] = None,
     h2: Optional[Dict[str, Dict[str, Any]]] = None,
+    h5: Optional[Dict[str, Dict[str, Any]]] = None,
+    h1m: Optional[Dict[str, Dict[str, Any]]] = None,
+    price_anchor: Optional[str] = None,
     md_map: Optional[Dict[str, Dict[str, Any]]] = None,
     meta: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    h0 = load_history_cached(cfg, d0)
+    h0 = load_history_cached(cfg, d0) if mode == "eod" else None
     if h1 is None:
         h1 = load_history_cached(cfg, d1)
     if h2 is None:
         h2 = load_history_cached(cfg, d2)
+    anchor = price_anchor or (d0 if mode == "eod" else d1)
+    if h5 is None:
+        d5 = trading_day_offset(cfg, anchor, 5)
+        h5 = load_history_cached(cfg, d5) if d5 else {}
+    if h1m is None:
+        d1m = trading_day_offset(cfg, anchor, TRADING_SESSIONS_1M)
+        h1m = load_history_cached(cfg, d1m) if d1m else {}
 
-    fut_meta = load_futures_secmeta_for(h0.keys()) if cfg.key == "futures" else {}
-    if cfg.key == "futures" and mode == "eod":
+    fut_meta = load_futures_secmeta_for((h0 or h1).keys()) if cfg.key == "futures" else {}
+    if cfg.key == "futures" and mode == "eod" and h0:
         prefetch_moex_futures_titles(
             [str(fut_meta.get(sid, {}).get("SHORTNAME") or h0[sid].get("SHORTNAME") or "") for sid in h0]
         )
@@ -825,16 +1264,23 @@ def build_table_rows(
     rows_out: List[Dict[str, Any]] = []
 
     if mode == "eod":
+        assert h0 is not None
         for secid, r0 in h0.items():
             c0 = close_from_history_row(r0, cfg.engine)
             r1 = h1.get(secid)
             r2 = h2.get(secid)
+            r5 = h5.get(secid) if h5 else None
+            r1m = h1m.get(secid) if h1m else None
             c1 = close_from_history_row(r1 or {}, cfg.engine) if r1 else None
             c2 = close_from_history_row(r2 or {}, cfg.engine) if r2 else None
+            c5 = close_from_history_row(r5 or {}, cfg.engine) if r5 else None
+            c1m = close_from_history_row(r1m or {}, cfg.engine) if r1m else None
             if c0 is None or c1 is None or c2 is None:
                 continue
             ch1 = (c0 / c1 - 1.0) * 100.0
             ch2 = (c0 / c2 - 1.0) * 100.0
+            ch5 = (c0 / c5 - 1.0) * 100.0 if c5 else None
+            ch1m = (c0 / c1m - 1.0) * 100.0 if c1m else None
             assetcode = r0.get("ASSETCODE") if cfg.engine == "futures" else None
             hist_sn = r0.get("SHORTNAME") or secid
             fm = fut_meta.get(secid, {})
@@ -863,15 +1309,15 @@ def build_table_rows(
                 "secid": secid,
                 "ticker": ticker,
                 "shortname": disp_name,
-                "close0": round(c0, 1),
-                "close1": round(c1, 1),
-                "close2": round(c2, 1),
+                "close0": round(c0, 2),
                 "chg1": round(ch1, 1),
                 "chg2": round(ch2, 1),
-                "risk": round(rk * 100, 1) if rk is not None else None,
+                "chg5": round(ch5, 1) if ch5 is not None else None,
+                "chg1m": round(ch1m, 1) if ch1m is not None else None,
+                "risk": round(rk * 100) if rk is not None else None,
                 "ratio1": round(rp1, 1) if rp1 is not None else None,
                 "ratio2": round(rp2, 1) if rp2 is not None else None,
-                "vol_rub": round(vr, 2) if vr is not None else None,
+                "vol_rub": round(vr, 0) if vr is not None else None,
                 "hl": row_highlight(rp1, rp2),
             }
             if cfg.key == "futures":
@@ -892,12 +1338,18 @@ def build_table_rows(
                 continue
             r1 = h1.get(secid)
             r2 = h2.get(secid)
+            r5 = h5.get(secid) if h5 else None
+            r1m = h1m.get(secid) if h1m else None
             c1 = close_from_history_row(r1 or {}, cfg.engine) if r1 else None
             c2 = close_from_history_row(r2 or {}, cfg.engine) if r2 else None
+            c5 = close_from_history_row(r5 or {}, cfg.engine) if r5 else None
+            c1m = close_from_history_row(r1m or {}, cfg.engine) if r1m else None
             if c1 is None or c2 is None:
                 continue
             ch1 = (c / c1 - 1.0) * 100.0
             ch2 = (c / c2 - 1.0) * 100.0
+            ch5 = (c / c5 - 1.0) * 100.0 if c5 else None
+            ch1m = (c / c1m - 1.0) * 100.0 if c1m else None
             assetcode = m.get("ASSETCODE")
             rk = risk_for_security(cfg, secid, assetcode, stock_lim, cur_lim, fut_lim, cur_assets)
             if risk_is_hundred_percent(rk):
@@ -921,15 +1373,15 @@ def build_table_rows(
                 "secid": secid,
                 "ticker": tkr,
                 "shortname": disp_name,
-                "close0": round(c, 1),
-                "close1": round(c1, 1),
-                "close2": round(c2, 1),
+                "close0": round(c, 2),
                 "chg1": round(ch1, 1),
                 "chg2": round(ch2, 1),
-                "risk": round(rk * 100, 1) if rk is not None else None,
+                "chg5": round(ch5, 1) if ch5 is not None else None,
+                "chg1m": round(ch1m, 1) if ch1m is not None else None,
+                "risk": round(rk * 100) if rk is not None else None,
                 "ratio1": round(rp1, 1) if rp1 is not None else None,
                 "ratio2": round(rp2, 1) if rp2 is not None else None,
-                "vol_rub": round(vr, 2) if vr is not None else None,
+                "vol_rub": round(vr, 0) if vr is not None else None,
                 "hl": row_highlight(rp1, rp2),
             }
             if cfg.key == "futures":
@@ -939,100 +1391,161 @@ def build_table_rows(
     if cfg.key == "futures" and rows_out:
         annotate_futures_maturity_rank(rows_out)
 
-    rows_out.sort(key=lambda x: -abs(x["chg1"]))
+    rows_out.sort(key=lambda x: -(x.get("ratio2") or 0))
     return rows_out
 
 
-def collect_eod_report_dates(stock_cfg: MarketConfig, today: date, max_sessions: int) -> List[str]:
-    """Уникальные торговые даты отчёта (ed0), новые первыми — последняя завершённая сессия с ценами в истории."""
-    out: List[str] = []
-    seen: set = set()
-    for delta in range(EOD_LOOKBACK_DAYS + 60):
-        d = today - timedelta(days=delta)
+def collect_eod_report_dates(stock_cfg: MarketConfig, today: date) -> List[str]:
+    """Все торговые дни за последний календарный месяц (новые первыми)."""
+    month_start = (today - timedelta(days=EOD_MONTH_CALENDAR_DAYS)).strftime("%Y-%m-%d")
+    dates = trading_dates_cached(stock_cfg, today, EOD_MONTH_CALENDAR_DAYS + 15)
+    return sorted([d for d in dates if d >= month_start], reverse=True)
+
+
+def _build_market_blocks(
+    key: str,
+    cfg: MarketConfig,
+    today: date,
+    eod_candidates: List[str],
+    stock_lim: Dict[str, float],
+    cur_lim: Dict[str, float],
+    fut_lim: Dict[str, float],
+    cur_assets: List[str],
+    vol_cache: Dict[str, Dict[str, float]],
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    d0, d1, d2 = get_three_trading_days(cfg, today)
+    ref1, ref2 = live_comparison_close_dates(cfg, today)
+    d5 = trading_day_offset(cfg, ref1, 5)
+    d1m = trading_day_offset(cfg, ref1, TRADING_SESSIONS_1M)
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        f_h1 = ex.submit(load_history_cached, cfg, ref1)
+        f_h2 = ex.submit(load_history_cached, cfg, ref2)
+        f_h5 = ex.submit(load_history_cached, cfg, d5) if d5 else None
+        f_h1m = ex.submit(load_history_cached, cfg, d1m) if d1m else None
+        f_md = ex.submit(live_market_block, cfg)
+        h1 = f_h1.result()
+        h2 = f_h2.result()
+        h5 = f_h5.result() if f_h5 else {}
+        h1m = f_h1m.result() if f_h1m else {}
+        md_map, meta = f_md.result()
+
+    current_block = {
+        "title": cfg.title,
+        "rows": build_table_rows(
+            cfg,
+            "live",
+            d0,
+            d1,
+            d2,
+            stock_lim,
+            cur_lim,
+            fut_lim,
+            cur_assets,
+            vol_cache,
+            h1=h1,
+            h2=h2,
+            h5=h5,
+            h1m=h1m,
+            price_anchor=ref1,
+            md_map=md_map,
+            meta=meta,
+        ),
+    }
+
+    eod_by_date: Dict[str, Any] = {}
+
+    def build_eod_day(ed0: str) -> Optional[Tuple[str, Dict[str, Any]]]:
         try:
-            ed0, _, _ = get_three_trading_days(stock_cfg, d)
-        except RuntimeError:
-            continue
-        if ed0 not in seen:
-            seen.add(ed0)
-            out.append(ed0)
-        if len(out) >= max_sessions:
-            break
-    return out
-
-
-def generate_report() -> Path:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    stock_lim = load_risk_limits_stock()
-    cur_lim = load_risk_limits_currency()
-    fut_lim = load_risk_limits_futures()
-    cur_assets = sorted(cur_lim.keys(), key=len, reverse=True)
-    vol_cache = merge_currency_volumes(load_volume_cache())
-
-    today = date.today()
-    stock_cfg = MARKETS["stock"]
-    eod_candidates = collect_eod_report_dates(stock_cfg, today, EOD_CANDIDATE_TRADING_DAYS)
-
-    current_data: Dict[str, Any] = {}
-    eod_data: Dict[str, Any] = {}
-
-    for key, cfg in MARKETS.items():
-        d0, d1, d2 = get_three_trading_days(cfg, today)
-        ref1, ref2 = live_comparison_close_dates(cfg, today)
-        h1 = load_history_cached(cfg, ref1)
-        h2 = load_history_cached(cfg, ref2)
-        md_map, meta = live_market_block(cfg)
-        current_data[key] = {
-            "title": cfg.title,
-            "basis": f"Сравнение с ценами закрытия за {ref1} и {ref2}.",
-            "rows": build_table_rows(
+            ed0a, ed1, ed2 = get_three_trading_days(cfg, date.fromisoformat(ed0))
+        except (RuntimeError, ValueError):
+            return None
+        if ed0a != ed0:
+            return None
+        ed5 = trading_day_offset(cfg, ed0, 5)
+        ed1m = trading_day_offset(cfg, ed0, TRADING_SESSIONS_1M)
+        try:
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                jobs = [
+                    ex.submit(load_history_cached, cfg, ed0),
+                    ex.submit(load_history_cached, cfg, ed1),
+                    ex.submit(load_history_cached, cfg, ed2),
+                ]
+                if ed5:
+                    jobs.append(ex.submit(load_history_cached, cfg, ed5))
+                if ed1m:
+                    jobs.append(ex.submit(load_history_cached, cfg, ed1m))
+                for job in jobs:
+                    job.result()
+            rows = build_table_rows(
                 cfg,
-                "live",
-                d0,
-                d1,
-                d2,
+                "eod",
+                ed0,
+                ed1,
+                ed2,
                 stock_lim,
                 cur_lim,
                 fut_lim,
                 cur_assets,
                 vol_cache,
-                h1=h1,
-                h2=h2,
-                md_map=md_map,
-                meta=meta,
-            ),
+                price_anchor=ed0,
+            )
+        except Exception:
+            return None
+        return ed0, {
+            "trading_dates": {"report": ed0, "minus1d": ed1, "minus2d": ed2},
+            "rows": rows,
         }
 
-        eod_by_date: Dict[str, Any] = {}
-        for ed0 in eod_candidates:
-            if len(eod_by_date) >= EOD_DAYS_TO_SHOW:
-                break
-            try:
-                ed0a, ed1, ed2 = get_three_trading_days(cfg, date.fromisoformat(ed0))
-            except (RuntimeError, ValueError):
-                continue
-            if ed0a != ed0:
-                continue
-            try:
-                rows = build_table_rows(
-                    cfg,
-                    "eod",
-                    ed0,
-                    ed1,
-                    ed2,
-                    stock_lim,
-                    cur_lim,
-                    fut_lim,
-                    cur_assets,
-                    vol_cache,
-                )
-            except Exception:
-                continue
-            eod_by_date[ed0] = {
-                "trading_dates": {"report": ed0, "minus1d": ed1, "minus2d": ed2},
-                "rows": rows,
-            }
-        eod_data[key] = {"title": cfg.title, "by_date": eod_by_date}
+    eod_workers = min(max(len(eod_candidates), 1), 12)
+    with ThreadPoolExecutor(max_workers=eod_workers) as ex:
+        results = [r for r in ex.map(build_eod_day, eod_candidates) if r is not None]
+    for ed0, block in sorted(results, key=lambda x: x[0], reverse=True):
+        eod_by_date[ed0] = block
+
+    return key, current_block, {"title": cfg.title, "by_date": eod_by_date}
+
+
+def generate_report() -> Path:
+    t0 = time.perf_counter()
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        f_st = ex.submit(load_stock_limits_combined)
+        f_cu = ex.submit(load_risk_limits_currency)
+        f_fu = ex.submit(load_futures_limits_combined)
+        f_vo = ex.submit(merge_currency_volumes, load_volume_cache())
+        stock_lim, stock_conc_lim = f_st.result()
+        cur_lim = f_cu.result()
+        fut_lim, fut_conc_lim = f_fu.result()
+        vol_cache = f_vo.result()
+
+    cur_assets = sorted(cur_lim.keys(), key=len, reverse=True)
+    today = date.today()
+    stock_cfg = MARKETS["stock"]
+    eod_candidates = collect_eod_report_dates(stock_cfg, today)
+
+    current_data: Dict[str, Any] = {}
+    eod_data: Dict[str, Any] = {}
+
+    with ThreadPoolExecutor(max_workers=len(MARKETS)) as ex:
+        futures = [
+            ex.submit(
+                _build_market_blocks,
+                key,
+                cfg,
+                today,
+                eod_candidates,
+                stock_lim,
+                cur_lim,
+                fut_lim,
+                cur_assets,
+                vol_cache,
+            )
+            for key, cfg in MARKETS.items()
+        ]
+        for fut in as_completed(futures):
+            key, cur_block, eod_block = fut.result()
+            current_data[key] = cur_block
+            eod_data[key] = eod_block
 
     all_eod: List[str] = []
     for _m in eod_data.values():
@@ -1041,12 +1554,23 @@ def generate_report() -> Path:
     eod_max_date = all_eod_sorted[0] if all_eod_sorted else today.strftime("%Y-%m-%d")
     eod_min_date = all_eod_sorted[-1] if all_eod_sorted else ""
 
+    conc_report_day = eod_max_date
+    stock_medians, fut_medians = _load_or_build_volume_medians(conc_report_day, today)
+    concentration_data = build_concentration_data(
+        conc_report_day,
+        stock_conc_lim,
+        fut_conc_lim,
+        stock_medians,
+        fut_medians,
+    )
+
     payload = {
         "generated_at": datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M:%S"),
         "eod_max_date": eod_max_date,
         "eod_min_date": eod_min_date,
         "current": current_data,
         "eod": eod_data,
+        "concentration": concentration_data,
     }
 
     payload_json = json.dumps(payload, ensure_ascii=False)
@@ -1057,6 +1581,9 @@ def generate_report() -> Path:
     html = HTML_TEMPLATE.replace("__DATA__", embed_json)
     out_path = SCRIPT_DIR / "moex_report.html"
     out_path.write_text(html, encoding="utf-8")
+    elapsed = time.perf_counter() - t0
+    eod_day_count = len(all_eod_sorted)
+    print(f"Сборка отчёта: {elapsed:.1f} с (итогов EOD за месяц: {eod_day_count} торговых дней)")
     return out_path
 
 
@@ -1065,7 +1592,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Мониторинг достаточности ставок риска первого уровня</title>
+  <title>Мониторинг достаточности ставок риска и лимитов концентрации</title>
   <script src="https://cdn.sheetjs.com/xlsx-0.20.2/package/dist/xlsx.full.min.js"></script>
   <style>
     :root {
@@ -1148,13 +1675,39 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     tr:hover td { background: #fafafa; }
     .hl-yellow { background: #fff9c4 !important; }
     .hl-red { background: #ffcdd2 !important; }
-    .hl-crimson { background: #ef5350 !important; color: #1a0505; }
+    .hl-green { background: #e8f5e9 !important; }
+    .hl-yellow-conc { background: #fff8e1 !important; }
     .num-null { color: #bbb; }
+    th.col-emphasis, td.col-emphasis {
+      background: #f3f6fb !important;
+      border-left: 1px solid #d8e2f0;
+    }
+    th.col-emphasis { background: #e8eef8 !important; font-weight: 700; }
+    tr:hover td.col-emphasis { background: #eef3fa !important; }
+    tr.hl-yellow td.col-emphasis { background: #fff3b0 !important; }
+    tr.hl-red td.col-emphasis { background: #ffb4b4 !important; }
+    tr.hl-green td.col-emphasis { background: #dcedc8 !important; }
+    tr.hl-yellow-conc td.col-emphasis { background: #ffecb3 !important; }
     table.fx-cols th:nth-child(2),
     table.fx-cols td:nth-child(2) { text-align: right; }
     tr.col-filters td { text-align: center; background: #fafafa; padding: 0.25rem 0.2rem; }
     tr.col-filters input { width: 100%; max-width: 7rem; font-size: 0.72rem; padding: 0.2rem 0.25rem; border: 1px solid var(--border); border-radius: 4px; }
     tr.col-filters input.cf-numPair { max-width: 3.1rem; display: inline-block; }
+    th.col-ticker, td.col-ticker,
+    th.col-vol_rub, td.col-vol_rub,
+    th.col-num, td.col-num {
+      white-space: nowrap;
+    }
+    th.col-ticker, td.col-ticker { min-width: 5.5rem; }
+    th.col-vol_rub, td.col-vol_rub { min-width: 8rem; }
+    th.col-shortname, td.col-shortname {
+      white-space: normal;
+      word-break: break-word;
+      min-width: 7rem;
+      max-width: 16rem;
+      line-height: 1.35;
+      vertical-align: top;
+    }
     .export-btns { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
     .export-btns button {
       border: 1px solid var(--border); background: #fff; color: #333;
@@ -1165,13 +1718,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
   <header>
-    <h1>Мониторинг достаточности ставок риска первого уровня</h1>
+    <h1>Мониторинг достаточности ставок риска и лимитов концентрации</h1>
     <p class="sub"><strong>Время обновления (МСК):</strong> <span id="gen"></span></p>
   </header>
   <main>
     <div class="tabs">
       <button type="button" id="tab-cur" class="active">Текущие данные</button>
       <button type="button" id="tab-eod" class="off">Итоги торгового дня</button>
+      <button type="button" id="tab-conc" class="off">Лимиты концентрации</button>
     </div>
 
     <section class="panel" id="panel-cur">
@@ -1185,8 +1739,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <label>Поиск <input type="search" id="search-cur" placeholder="Тикер или название"/></label>
         <label id="wrap-fut-cur" style="display:none;">Срочность фьючерса
           <select id="fut-mat-cur">
-            <option value="all" selected>Все фьючерсы</option>
-            <option value="nearest">Ближайший по сроку</option>
+            <option value="all">Все фьючерсы</option>
+            <option value="nearest" selected>Ближайший по сроку</option>
             <option value="two">Два ближайших по сроку</option>
           </select>
         </label>
@@ -1195,7 +1749,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button type="button" id="btn-xlsx-cur">Скачать Excel</button>
         </span>
       </div>
-      <p class="meta" id="meta-cur"></p>
+      <p class="meta" id="meta-cur" style="display:none;"></p>
       <div class="wrap"><table id="tbl-cur"><thead></thead><tbody></tbody></table></div>
     </section>
 
@@ -1211,8 +1765,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <label>Поиск <input type="search" id="search-eod" placeholder="Тикер или название"/></label>
         <label id="wrap-fut-eod" style="display:none;">Срочность фьючерса
           <select id="fut-mat-eod">
-            <option value="all" selected>Все фьючерсы</option>
-            <option value="nearest">Ближайший по сроку</option>
+            <option value="all">Все фьючерсы</option>
+            <option value="nearest" selected>Ближайший по сроку</option>
             <option value="two">Два ближайших по сроку</option>
           </select>
         </label>
@@ -1221,8 +1775,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <button type="button" id="btn-xlsx-eod">Скачать Excel</button>
         </span>
       </div>
-      <p class="meta" id="meta-eod"></p>
+      <p class="meta" id="meta-eod" style="display:none;"></p>
       <div class="wrap"><table id="tbl-eod"><thead></thead><tbody></tbody></table></div>
+    </section>
+
+    <section class="panel" id="panel-conc" style="display:none;">
+      <h2>Лимиты концентрации</h2>
+      <div class="mkt" id="mkt-conc">
+        <button type="button" data-m="stock">Фондовый</button>
+        <button type="button" data-m="futures" class="off">Срочный</button>
+      </div>
+      <div class="toolbar">
+        <label>Поиск <input type="search" id="search-conc" placeholder="Тикер или название"/></label>
+        <span class="export-btns">
+          <button type="button" id="btn-csv-conc">Скачать CSV</button>
+          <button type="button" id="btn-xlsx-conc">Скачать Excel</button>
+        </span>
+      </div>
+      <p class="meta" id="meta-conc" style="display:none;"></p>
+      <div class="wrap"><table id="tbl-conc"><thead></thead><tbody></tbody></table></div>
     </section>
   </main>
   <script type="application/json" id="moex-embedded-data">__DATA__</script>
@@ -1253,6 +1824,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       else if (!d.eod[k].by_date || typeof d.eod[k].by_date !== 'object') d.eod[k].by_date = {};
     }
     if (d.generated_at == null) d.generated_at = '';
+    if (!d.concentration || typeof d.concentration !== 'object') {
+      d.concentration = { report_day: '', basis: '', stock: { title: '', rows: [] }, futures: { title: '', rows: [] } };
+    } else {
+      if (!d.concentration.stock) d.concentration.stock = { title: '', rows: [] };
+      if (!d.concentration.futures) d.concentration.futures = { title: '', rows: [] };
+      if (!Array.isArray(d.concentration.stock.rows)) d.concentration.stock.rows = [];
+      if (!Array.isArray(d.concentration.futures.rows)) d.concentration.futures.rows = [];
+    }
     return d;
   }
   let DATA = ensureDataShape({});
@@ -1279,17 +1858,57 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     { key: 'ticker', label: 'Тикер', num: false },
     { key: 'shortname', label: 'Название', num: false },
     { key: 'close0', label: 'Цена', num: true },
-    { key: 'close1', label: 'Цена закрытия −1д', num: true },
-    { key: 'close2', label: 'Цена закрытия −2д', num: true },
-    { key: 'chg1', label: 'Δ 1д %', num: true },
-    { key: 'chg2', label: 'Δ 2д %', num: true },
-    { key: 'risk', label: 'Ставка риска 1 ур.', num: true },
-    { key: 'ratio1', label: '|Δ1|/СР1', num: true },
-    { key: 'ratio2', label: '|Δ2|/СР1', num: true },
+    { key: 'chg1', label: '1д, %', num: true },
+    { key: 'chg2', label: '2д, %', num: true },
+    { key: 'chg5', label: '5д, %', num: true },
+    { key: 'chg1m', label: '1м, %', num: true },
+    { key: 'risk', label: 'СР1, %', num: true },
+    { key: 'ratio1', label: '1д/СР1, %', num: true, emphasis: true },
+    { key: 'ratio2', label: '2д/СР1, %', num: true, emphasis: true },
     { key: 'vol_rub', label: 'Оборот ₽', num: true },
   ];
+  const COLS_CONC = [
+    { key: 'ticker', label: 'Тикер', num: false },
+    { key: 'shortname', label: 'Название', num: false },
+    { key: 'price', label: 'Цена', num: true },
+    { key: 'lk1_cur', label: 'ЛК1 текущий', num: true },
+    { key: 'lk2_cur', label: 'ЛК2 текущий', num: true },
+    { key: 'lk1_calc', label: 'ЛК1 расчётный', num: true },
+    { key: 'lk2_calc', label: 'ЛК2 расчётный', num: true },
+    { key: 'lk2_cur_rub', label: 'ЛК2 текущий (руб.)', num: true, emphasis: true },
+    { key: 'lk2_calc_rub', label: 'ЛК2 расчётный (руб.)', num: true, emphasis: true },
+    { key: 'lk2_delta_pct', label: 'Относительная дельта', num: true, emphasis: true },
+  ];
+  function colsForConc(market) {
+    return COLS_CONC.map(c => {
+      if (c.key === 'price' && market === 'futures') {
+        return Object.assign({}, c, { label: 'Цена БА' });
+      }
+      if (c.key === 'shortname' && market === 'futures') {
+        return Object.assign({}, c, { label: 'Фьючерсный контракт на' });
+      }
+      return c;
+    });
+  }
+  function addThousandsSpaces(s) {
+    const parts = String(s).split('.');
+    parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+    return parts.join('.');
+  }
+  function fmtNumDot(x, decimals) {
+    if (x == null || x === '') return null;
+    const n = Number(x);
+    if (isNaN(n)) return null;
+    return addThousandsSpaces(n.toFixed(decimals == null ? 1 : decimals));
+  }
+  function fmtIntDot(x) {
+    if (x == null || x === '') return null;
+    const n = Number(x);
+    if (isNaN(n)) return null;
+    return addThousandsSpaces(String(Math.round(n)));
+  }
   function colsForMarket(eod, market) {
-    const pl = eod ? 'Цена закрытия' : 'Цена текущая';
+    const pl = eod ? 'Цена закрытия' : 'Цена';
     let base = COLS;
     if (market === 'currency') {
       base = COLS.filter(c => c.key !== 'shortname' && c.key !== 'vol_rub');
@@ -1299,12 +1918,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   let mode = 'cur';
   let marketCur = 'stock';
   let marketEod = 'stock';
-  let sortCol = 'chg1';
+  let marketConc = 'stock';
+  let sortCol = 'ratio2';
   let sortDir = -1;
-  let sortColE = 'chg1';
+  let sortColE = 'ratio2';
   let sortDirE = -1;
+  let sortColC = 'lk2_delta_pct';
+  let sortDirC = -1;
   const filtersCurByMkt = { stock: {}, currency: {}, futures: {} };
   const filtersEodByMkt = { stock: {}, currency: {}, futures: {} };
+  const filtersConcByMkt = { stock: {}, futures: {} };
 
   function updateGenLabel() {
     document.getElementById('gen').textContent = DATA.generated_at || '—';
@@ -1351,6 +1974,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     const day = block && block.by_date && block.by_date[d];
     return day && day.rows ? day.rows.slice() : [];
   }
+  function getRowsConc() {
+    const block = DATA.concentration && DATA.concentration[marketConc];
+    return (block && block.rows) ? block.rows.slice() : [];
+  }
   function filterRows(rows, q) {
     if (!q || !q.trim()) return rows;
     const s = q.trim().toLowerCase();
@@ -1391,24 +2018,31 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   function escapeAttr(s) {
     return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/"/g,'&quot;');
   }
+  function colClass(c) {
+    let cl = 'col-' + c.key;
+    if (c.num) cl += ' col-num';
+    if (c.emphasis) cl += ' col-emphasis';
+    return cl;
+  }
   function renderThead(tblId, sortKey, sortD, onHeadClick, colList, filt, onFilterTyping) {
     const thead = document.querySelector('#' + tblId + ' thead');
     const cols = colList || COLS;
     cols.forEach(c => ensureSlot(filt, c));
     const row1 = '<tr>' + cols.map(c => {
-      const cl = (c.key === sortKey) ? ' class="sorted' + (sortD < 0 ? ' desc' : '') + '"' : '';
-      return '<th data-k="' + c.key + '"' + cl + '>' + c.label + '</th>';
+      const cl = (c.key === sortKey ? 'sorted' + (sortD < 0 ? ' desc' : '') : '') + ' ' + colClass(c);
+      return '<th data-k="' + c.key + '" class="' + cl.trim() + '">' + c.label + '</th>';
     }).join('') + '</tr>';
     const row2 = '<tr class="col-filters">' + cols.map(c => {
       const s = filt[c.key];
+      const tdCl = colClass(c);
       if (c.num) {
         const mn = (s && s.min) != null ? String(s.min) : '';
         const mx = (s && s.max) != null ? String(s.max) : '';
-        return '<td onclick="event.stopPropagation()"><input type="number" step="any" class="cf-numPair" placeholder="≥" data-k="' + c.key + '" data-part="min" value="' + escapeAttr(mn) + '"/> ' +
+        return '<td class="' + tdCl + '" onclick="event.stopPropagation()"><input type="number" step="any" class="cf-numPair" placeholder="≥" data-k="' + c.key + '" data-part="min" value="' + escapeAttr(mn) + '"/> ' +
           '<input type="number" step="any" class="cf-numPair" placeholder="≤" data-k="' + c.key + '" data-part="max" value="' + escapeAttr(mx) + '"/></td>';
       }
       const tv = (s && s.text) != null ? String(s.text) : '';
-      return '<td onclick="event.stopPropagation()"><input type="text" class="cf-text" placeholder="содержит…" data-k="' + c.key + '" value="' + escapeAttr(tv) + '"/></td>';
+      return '<td class="' + tdCl + '" onclick="event.stopPropagation()"><input type="text" class="cf-text" placeholder="содержит…" data-k="' + c.key + '" value="' + escapeAttr(tv) + '"/></td>';
     }).join('') + '</tr>';
     thead.innerHTML = row1 + row2;
     thead.querySelectorAll('th').forEach(th => {
@@ -1439,7 +2073,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     ccols.forEach(c => ensureSlot(filt, c));
     rows = applyColFilters(rows, ccols, filt);
     const keys = ccols.map(c => c.key);
-    if (keys.indexOf(sortCol) < 0) { sortCol = 'chg1'; sortDir = -1; }
+    if (keys.indexOf(sortCol) < 0) { sortCol = 'ratio2'; sortDir = -1; }
     rows = sortRows(rows, sortCol, sortDir, ccols);
     return { rows, ccols };
   }
@@ -1452,31 +2086,60 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     ecols.forEach(c => ensureSlot(filt, c));
     rows = applyColFilters(rows, ecols, filt);
     const keysE = ecols.map(c => c.key);
-    if (keysE.indexOf(sortColE) < 0) { sortColE = 'chg1'; sortDirE = -1; }
+    if (keysE.indexOf(sortColE) < 0) { sortColE = 'ratio2'; sortDirE = -1; }
     rows = sortRows(rows, sortColE, sortDirE, ecols);
     return { rows, ecols };
   }
-  function cellHtml(c, r, f, fmtNum, fmtVol) {
+  function computeRowsConc() {
+    let rows = getRowsConc();
+    rows = filterRows(rows, document.getElementById('search-conc').value);
+    const ccols = colsForConc(marketConc);
+    const filt = filtersConcByMkt[marketConc];
+    ccols.forEach(c => ensureSlot(filt, c));
+    rows = applyColFilters(rows, ccols, filt);
+    const keysC = ccols.map(c => c.key);
+    if (keysC.indexOf(sortColC) < 0) { sortColC = 'lk2_delta_pct'; sortDirC = -1; }
+    rows = sortRows(rows, sortColC, sortDirC, ccols);
+    return { rows, ccols };
+  }
+  function cellHtml(c, r, f) {
     const k = c.key;
+    const cl = colClass(c);
     if (k === 'ticker') {
       const tick = (r.ticker != null && r.ticker !== '') ? r.ticker : r.secid;
-      return '<td><strong>' + escapeHtml(String(tick)) + '</strong></td>';
+      return '<td class="' + cl + '"><strong>' + escapeHtml(String(tick)) + '</strong></td>';
     }
-    if (k === 'shortname') return '<td>' + escapeHtml(String(r.shortname || '')) + '</td>';
-    if (k === 'close0' || k === 'close1' || k === 'close2' || k === 'chg1' || k === 'chg2' || k === 'risk' || k === 'ratio1' || k === 'ratio2')
-      return '<td>' + fmtNum(r[k]) + '</td>';
-    if (k === 'vol_rub') return '<td>' + fmtVol(r.vol_rub) + '</td>';
-    return '<td></td>';
+    if (k === 'shortname') return '<td class="' + cl + '">' + escapeHtml(String(r.shortname || '')) + '</td>';
+    if (k === 'price' || k === 'close0') {
+      const v = fmtNumDot(r[k], 2);
+      return '<td class="' + cl + '">' + (v != null ? v : f(r[k])) + '</td>';
+    }
+    if (k === 'lk2_delta_pct') {
+      const v = r[k];
+      if (v == null || v === '') return '<td class="' + cl + '">' + f(v) + '</td>';
+      const n = Number(v);
+      const s = (n > 0 ? '+' : '') + fmtNumDot(n, 1) + '%';
+      return '<td class="' + cl + '">' + s + '</td>';
+    }
+    if (k === 'lk1_cur' || k === 'lk2_cur' || k === 'lk1_calc' || k === 'lk2_calc' || k === 'lk2_cur_rub' || k === 'lk2_calc_rub' || k === 'vol_rub') {
+      const v = fmtIntDot(r[k]);
+      return '<td class="' + cl + '">' + (v != null ? v : f(r[k])) + '</td>';
+    }
+    if (k === 'risk') {
+      const v = fmtIntDot(r[k]);
+      return '<td class="' + cl + '">' + (v != null ? v : f(r[k])) + '</td>';
+    }
+    if (k === 'chg1' || k === 'chg2' || k === 'chg5' || k === 'chg1m' || k === 'ratio1' || k === 'ratio2') {
+      const v = fmtNumDot(r[k], 1);
+      return '<td class="' + cl + '">' + (v != null ? v : f(r[k])) + '</td>';
+    }
+    return '<td class="' + cl + '"></td>';
   }
   function renderTbody(tbody, rows, colList) {
     const cols = colList || COLS;
     tbody.innerHTML = rows.map(r => {
       const f = (x) => (x != null && x !== '') ? x : '<span class="num-null">—</span>';
-      const fmtNum = (x) => (x != null && typeof x === 'number')
-        ? x.toLocaleString('ru-RU', { minimumFractionDigits: 0, maximumFractionDigits: 1 })
-        : f(x);
-      const fmtVol = (x) => (x != null && typeof x === 'number') ? x.toLocaleString('ru-RU', { maximumFractionDigits: 0 }) : f(x);
-      return '<tr class="' + (r.hl || '') + '">' + cols.map(c => cellHtml(c, r, f, fmtNum, fmtVol)).join('') + '</tr>';
+      return '<tr class="' + (r.hl || '') + '">' + cols.map(c => cellHtml(c, r, f)).join('') + '</tr>';
     }).join('');
   }
   function escapeHtml(s) {
@@ -1490,13 +2153,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     const { rows, ecols } = computeRowsEod();
     renderTbody(document.querySelector('#tbl-eod tbody'), rows, ecols);
   }
+  function refreshConcBodyOnly() {
+    const { rows, ccols } = computeRowsConc();
+    renderTbody(document.querySelector('#tbl-conc tbody'), rows, ccols);
+  }
   function refreshCur() {
     if (!DATA || !DATA.current) return;
     const inp = document.getElementById('search-cur');
     inp.placeholder = (marketCur === 'currency') ? 'Тикер' : 'Тикер или название';
     document.getElementById('wrap-fut-cur').style.display = (marketCur === 'futures') ? '' : 'none';
     const { rows, ccols } = computeRowsCur();
-    document.getElementById('meta-cur').textContent = (DATA.current[marketCur] && DATA.current[marketCur].basis) || '';
     document.getElementById('tbl-cur').className = (marketCur === 'currency') ? 'fx-cols' : '';
     const filt = filtersCurByMkt[marketCur];
     renderThead('tbl-cur', sortCol, sortDir, (k) => {
@@ -1529,13 +2195,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     inpe.placeholder = (marketEod === 'currency') ? 'Тикер' : 'Тикер или название';
     document.getElementById('wrap-fut-eod').style.display = (marketEod === 'futures') ? '' : 'none';
     const { rows, ecols } = computeRowsEod();
-    const d = document.getElementById('date-eod').value;
-    const block = DATA.eod[marketEod];
-    const day = block && block.by_date && block.by_date[d];
-    const td = day && day.trading_dates;
-    document.getElementById('meta-eod').textContent = td
-      ? ('Торговые дни: отчёт ' + td.report + ', −1д ' + td.minus1d + ', −2д ' + td.minus2d)
-      : ('Нет данных за ' + d);
     document.getElementById('tbl-eod').className = (marketEod === 'currency') ? 'fx-cols' : '';
     const filt = filtersEodByMkt[marketEod];
     renderThead('tbl-eod', sortColE, sortDirE, (k) => {
@@ -1543,6 +2202,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       refreshEod();
     }, ecols, filt, refreshEodBodyOnly);
     renderTbody(document.querySelector('#tbl-eod tbody'), rows, ecols);
+  }
+  function refreshConc() {
+    if (!DATA || !DATA.concentration) return;
+    const { rows, ccols } = computeRowsConc();
+    const filt = filtersConcByMkt[marketConc];
+    renderThead('tbl-conc', sortColC, sortDirC, (k) => {
+      if (k === sortColC) sortDirC = -sortDirC; else { sortColC = k; sortDirC = -1; }
+      refreshConc();
+    }, ccols, filt, refreshConcBodyOnly);
+    renderTbody(document.querySelector('#tbl-conc tbody'), rows, ccols);
   }
   function rowsToAoA(rows, cols) {
     const head = cols.map(c => c.label);
@@ -1583,32 +2252,33 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   function safeFilename(s) {
     return String(s).replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 80);
   }
-  document.getElementById('tab-cur').onclick = () => {
-    document.getElementById('tab-cur').className = 'active';
-    document.getElementById('tab-eod').className = 'off';
-    document.getElementById('panel-cur').style.display = 'block';
-    document.getElementById('panel-eod').style.display = 'none';
-  };
-  document.getElementById('tab-eod').onclick = () => {
-    document.getElementById('tab-eod').className = 'active';
-    document.getElementById('tab-cur').className = 'off';
-    document.getElementById('panel-eod').style.display = 'block';
-    document.getElementById('panel-cur').style.display = 'none';
-  };
-  function bindMkt(id, isEod) {
+  function showPanel(name) {
+    ['cur', 'eod', 'conc'].forEach(p => {
+      document.getElementById('panel-' + p).style.display = (p === name) ? 'block' : 'none';
+      document.getElementById('tab-' + p).className = (p === name) ? 'active' : 'off';
+    });
+    mode = name;
+  }
+  document.getElementById('tab-cur').onclick = () => showPanel('cur');
+  document.getElementById('tab-eod').onclick = () => showPanel('eod');
+  document.getElementById('tab-conc').onclick = () => { showPanel('conc'); refreshConc(); };
+  function bindMkt(id, isEod, isConc) {
     document.querySelectorAll('#' + id + ' button').forEach(btn => {
       btn.onclick = () => {
         document.querySelectorAll('#' + id + ' button').forEach(b => { b.className = 'off'; });
         btn.className = '';
         if (isEod) { marketEod = btn.dataset.m; refreshEod(); }
+        else if (isConc) { marketConc = btn.dataset.m; refreshConc(); }
         else { marketCur = btn.dataset.m; refreshCur(); }
       };
     });
   }
-  bindMkt('mkt-cur', false);
-  bindMkt('mkt-eod', true);
+  bindMkt('mkt-cur', false, false);
+  bindMkt('mkt-eod', true, false);
+  bindMkt('mkt-conc', false, true);
   document.getElementById('search-cur').oninput = refreshCurBodyOnly;
   document.getElementById('search-eod').oninput = refreshEodBodyOnly;
+  document.getElementById('search-conc').oninput = refreshConcBodyOnly;
   document.getElementById('fut-mat-cur').onchange = refreshCur;
   document.getElementById('fut-mat-eod').onchange = refreshEod;
 
@@ -1623,6 +2293,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       updateGenLabel();
       refreshCur();
       refreshEod();
+      refreshConc();
     } catch (e) { console.warn('moex_report_data.json', e); }
   }
   setInterval(pullLatestData, 10 * 60 * 1000);
@@ -1649,6 +2320,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     const d = document.getElementById('date-eod').value || '';
     exportXlsx('eod_' + marketEod + '_' + d + '_' + stamp() + '.xlsx', rows, ecols);
   };
+  document.getElementById('btn-csv-conc').onclick = () => {
+    const { rows, ccols } = computeRowsConc();
+    const rd = (DATA.concentration && DATA.concentration.report_day) || '';
+    exportCsv('conc_' + marketConc + '_' + rd + '_' + stamp() + '.csv', rows, ccols);
+  };
+  document.getElementById('btn-xlsx-conc').onclick = () => {
+    const { rows, ccols } = computeRowsConc();
+    const rd = (DATA.concentration && DATA.concentration.report_day) || '';
+    exportXlsx('conc_' + marketConc + '_' + rd + '_' + stamp() + '.xlsx', rows, ccols);
+  };
 
   async function startApp() {
     document.getElementById('gen').textContent = canPoll ? 'Загрузка…' : (DATA.generated_at || '—');
@@ -1657,6 +2338,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     document.getElementById('date-eod').onchange = refreshEod;
     refreshCur();
     refreshEod();
+    refreshConc();
   }
   startApp();
   </script>
