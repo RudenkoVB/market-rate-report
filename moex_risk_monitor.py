@@ -627,7 +627,7 @@ def _conc_row(
     return {
         "ticker": ticker,
         "shortname": shortname,
-        "price": round(price, 2) if price is not None else None,
+        "price": round_price_display(price),
         "lk1_cur": round(lk1_cur, 0) if lk1_cur is not None else None,
         "lk2_cur": round(lk2_cur, 0) if lk2_cur is not None else None,
         "lk1_calc": round(lk1_calc, 0) if lk1_calc is not None else None,
@@ -1018,6 +1018,31 @@ def risk_for_security(
     return None
 
 
+def round_price_display(value: Optional[float]) -> Optional[float]:
+    """Округление цены: обычно до сотых; для цен < 0.1 — до второго значащего дробного знака."""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(v):
+        return None
+    av = abs(v)
+    if av == 0:
+        return 0.0
+    if av >= 0.1:
+        return round(v, 2)
+    pos = 0
+    for i in range(1, 15):
+        if av * (10**i) >= 1:
+            pos = i
+            break
+    else:
+        pos = 14
+    return round(v, pos + 1)
+
+
 def row_highlight(r1: Optional[float], r2: Optional[float]) -> str:
     vals = [x for x in (r1, r2) if x is not None and not math.isnan(x)]
     if not vals:
@@ -1025,7 +1050,7 @@ def row_highlight(r1: Optional[float], r2: Optional[float]) -> str:
     m = max(vals)
     if m >= 100:
         return "hl-red"
-    if m >= 50:
+    if m >= 80:
         return "hl-yellow"
     return ""
 
@@ -1309,7 +1334,7 @@ def build_table_rows(
                 "secid": secid,
                 "ticker": ticker,
                 "shortname": disp_name,
-                "close0": round(c0, 2),
+                "close0": round_price_display(c0),
                 "chg1": round(ch1, 1),
                 "chg2": round(ch2, 1),
                 "chg5": round(ch5, 1) if ch5 is not None else None,
@@ -1373,7 +1398,7 @@ def build_table_rows(
                 "secid": secid,
                 "ticker": tkr,
                 "shortname": disp_name,
-                "close0": round(c, 2),
+                "close0": round_price_display(c),
                 "chg1": round(ch1, 1),
                 "chg2": round(ch2, 1),
                 "chg5": round(ch5, 1) if ch5 is not None else None,
@@ -1892,8 +1917,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
   function addThousandsSpaces(s) {
     const parts = String(s).split('.');
-    parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+    parts[0] = parts[0].replace(/\\B(?=(\\d{3})+(?!\\d))/g, ' ');
     return parts.join('.');
+  }
+  function roundPriceSmart(n) {
+    const v = Number(n);
+    if (isNaN(v)) return null;
+    const av = Math.abs(v);
+    if (av === 0) return 0;
+    if (av >= 0.1) return Math.round(v * 100) / 100;
+    let pos = 0;
+    for (let i = 1; i <= 14; i++) {
+      if (av * Math.pow(10, i) >= 1) { pos = i; break; }
+    }
+    if (!pos) pos = 14;
+    const mult = Math.pow(10, pos + 1);
+    return Math.round(v * mult) / mult;
+  }
+  function fmtPriceDot(x) {
+    if (x == null || x === '') return null;
+    const n = roundPriceSmart(x);
+    if (n == null || isNaN(n)) return null;
+    return addThousandsSpaces(String(parseFloat(n.toFixed(10))));
   }
   function fmtNumDot(x, decimals) {
     if (x == null || x === '') return null;
@@ -2111,7 +2156,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
     if (k === 'shortname') return '<td class="' + cl + '">' + escapeHtml(String(r.shortname || '')) + '</td>';
     if (k === 'price' || k === 'close0') {
-      const v = fmtNumDot(r[k], 2);
+      const v = fmtPriceDot(r[k]);
       return '<td class="' + cl + '">' + (v != null ? v : f(r[k])) + '</td>';
     }
     if (k === 'lk2_delta_pct') {
